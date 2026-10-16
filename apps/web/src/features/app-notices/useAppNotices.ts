@@ -16,7 +16,7 @@ export interface WatchdogAlert { id: string; message: string; timestamp: string 
 export interface AppNotices {
   liveDebugToast: LiveDebugToast | null;
   dismissLiveDebugToast: () => void;
-  /** Logs the message and shows it as a toast for 4.5 seconds. */
+  /** Logs every message; only errors show a toast for 4.5 seconds. */
   showLiveDebug: (message: string, type?: LiveDebugTone) => void;
   watchdogAlerts: WatchdogAlert[];
   /** Adds an alert unless one with the same id is shown. */
@@ -44,6 +44,8 @@ export function useAppNotices(): AppNotices {
 
   const showLiveDebug = useCallback((message: string, type: LiveDebugTone = "info") => {
     console.log(`[AI-Live-Debug][${type.toUpperCase()}] ${message}`);
+    // Progress notes ("button tapped", "pane opened") stay in the console; only failures reach the screen.
+    if (type !== "error") return;
     if (liveDebugTimerRef.current !== null) window.clearTimeout(liveDebugTimerRef.current);
     setLiveDebugToast({ id: Date.now(), message, type });
     liveDebugTimerRef.current = window.setTimeout(() => {
