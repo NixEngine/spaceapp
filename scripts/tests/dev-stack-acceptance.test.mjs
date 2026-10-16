@@ -125,6 +125,18 @@ test("session rejects a missing native command and synthetic transcript output",
   const another = session(); another.body.transcript = [{ stream: "system", data: "session allocated" }];
   assert.throws(() => assertSession(another, expected), /CLI_SESSION/u);
 });
+
+test("session diagnostics identify a failed predicate without echoing response values", () => {
+  const value = session(); value.body.session.cwd = "/etc/private-canary-not-for-logs";
+  assert.throws(() => assertSession(value, expected), error => {
+    assert.equal(error.code, "DEV_STACK_ACCEPTANCE_CLI_SESSION_CWD");
+    assert.equal(error.message, "DEV_STACK_ACCEPTANCE_CLI_SESSION_CWD");
+    assert.equal(error.message.includes("private-canary"), false);
+    return true;
+  });
+  assert.throws(() => assertSession({ status: 503, body: null }, expected),
+    /CLI_SESSION_HTTP_STATUS/u);
+});
 test("WS ticket must bind the pane/session and cannot be a proof ticket", () => {
   for (const patch of [{ paneId: "pane:other" }, { sessionId: "session:other" }, { token: "short" },
     { expiresAt: "not a date" }, { proofScope: "READ_ONLY" }]) {
@@ -294,8 +306,13 @@ test("a web proxy reaching a different owner is rejected before WS attachment", 
     if (url.pathname === "/api/panes") return jsonResponse({ data: [{ id: expected.paneId, roomId: expected.roomId,
       mode: "TERMINAL", terminalRuntimeId: "cli:opencode", title: "OpenCode CLI", isClosed: false }] });
     if (url.pathname.endsWith("/cli/session")) {
-      const body = session().body; body.session.cwd = join(syntheticState().stateDir, "workspaces");
+      const body = session().body;
+      const workspaceRoot = join(syntheticState().stateDir, "workspaces");
+      body.session.cwd = join(workspaceRoot, "acceptance");
       assert.equal(JSON.parse(options.body).cwd, body.session.cwd);
+      // Root equality invokes the API's legacy /etc alias. The real request
+      // must name a concrete isolated child, not merely accept any returned cwd.
+      assert.notEqual(JSON.parse(options.body).cwd, workspaceRoot);
       assert.equal(JSON.parse(options.body).includeTranscript, false);
       return jsonResponse(body);
     }

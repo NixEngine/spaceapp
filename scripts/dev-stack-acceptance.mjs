@@ -81,15 +81,25 @@ export function selectStarterPane({ status, body }, roomId) {
 export function assertSession({ status, body }, expected, { requireRunning = false } = {}) {
   const session = body?.session;
   const runtime = body?.runtime;
-  requireCondition(status === 200 && nonempty(session?.sessionId)
-    && session.paneId === expected.paneId && session.roomId === expected.roomId
-    && session.runtimeId === RUNTIME && session.purpose === "NORMAL" && session.isActive === true
-    && session.cwd === expected.cwd && session.endedAt === null && session.exitCode === null
-    && (requireRunning ? session.status === "RUNNING" : ["IDLE", "RUNNING"].includes(session.status))
-    && (!expected.sessionId || session.sessionId === expected.sessionId)
-    && runtime?.id === RUNTIME && runtime.capabilities?.includes("CLI")
-    && nonempty(runtime.detectedCommandPath) && Array.isArray(body.transcript)
-    && body.transcript.length === 0, "CLI_SESSION");
+  // Fixed predicate labels make live failures diagnosable without echoing the
+  // response, its ticket, terminal text or any untrusted field value.
+  const checks = [
+    ["HTTP_STATUS", status === 200],
+    ["IDENTITY", nonempty(session?.sessionId)],
+    ["PANE", session?.paneId === expected.paneId],
+    ["ROOM", session?.roomId === expected.roomId],
+    ["RUNTIME", session?.runtimeId === RUNTIME],
+    ["PURPOSE", session?.purpose === "NORMAL"],
+    ["ACTIVE", session?.isActive === true],
+    ["CWD", session?.cwd === expected.cwd],
+    ["NOT_ENDED", session?.endedAt === null && session?.exitCode === null],
+    ["STATUS", requireRunning ? session?.status === "RUNNING" : ["IDLE", "RUNNING"].includes(session?.status)],
+    ["SAME_SESSION", !expected.sessionId || session?.sessionId === expected.sessionId],
+    ["CLI_RUNTIME", runtime?.id === RUNTIME && Array.isArray(runtime?.capabilities) && runtime.capabilities.includes("CLI")],
+    ["COMMAND", nonempty(runtime?.detectedCommandPath)],
+    ["NO_TRANSCRIPT", Array.isArray(body?.transcript) && body.transcript.length === 0],
+  ];
+  for (const [label, passed] of checks) requireCondition(passed, `CLI_SESSION_${label}`);
   const ticket = body.websocket;
   requireCondition(ticket?.paneId === session.paneId && ticket.sessionId === session.sessionId
     && typeof ticket.token === "string" && /^[A-Za-z0-9_-]{24,512}$/u.test(ticket.token)
@@ -432,7 +442,10 @@ export async function runAcceptance({ state, timeoutMs = 180000 }) {
   const starter = await request("/api/setup/starter-room", { method: "POST", body: {} });
   const roomId = assertStarterRoom(starter, expectedRoomId);
   const pane = selectStarterPane(await request(`/api/panes?roomId=${encodeURIComponent(roomId)}`), roomId);
-  const cwd = join(state.stateDir, "workspaces");
+  // The original CLI parity route treats cliWorkspaceRoot itself as a legacy
+  // placeholder and rewrites it to /etc. A concrete child is kept verbatim,
+  // allowing exact isolation checks without weakening the response assertion.
+  const cwd = join(state.stateDir, "workspaces", "acceptance");
   const expected = { roomId, paneId: pane.id, cwd };
   const allocation = await request(`/api/panes/${encodeURIComponent(pane.id)}/cli/session`, {
     method: "POST", body: { runtimeId: RUNTIME, cwd, includeTranscript: false },
