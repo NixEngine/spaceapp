@@ -27,6 +27,12 @@ function nonempty(value) {
   return typeof value === "string" && value.length > 0;
 }
 
+/** Initial native macOS preparation needs its measured cold-start allowance. */
+export function sourceStartupTimeoutMs(platform, initial = false) {
+  requireCondition(["linux", "darwin"].includes(platform) && typeof initial === "boolean", "STARTUP_BUDGET");
+  return (platform === "darwin" && initial ? 20 : 15) * 60_000;
+}
+
 /** HTTP 200 alone is deliberately insufficient, including with ?strict=1. */
 export function assertReadiness({ status, body }) {
   const dependencies = body?.dependencies;
@@ -38,6 +44,24 @@ export function assertReadiness({ status, body }) {
   // worker=RUNNING is the source's workflow+activity poller check; this does
   // not assert that a workflow or provider task has been executed.
   return true;
+}
+
+/** Admin metadata must use the actual checkout and preserve real storage policy. */
+export function assertSourceStorage(admin, storage, repoRoot) {
+  requireCondition(admin?.status === 200 && admin.body?.status === "ok"
+    && Array.isArray(admin.body.capabilities) && admin.body.storageWarning === "", "ADMIN_ENDPOINT");
+  const body = storage?.body, root = body?.root, app = body?.app;
+  requireCondition(storage?.status === 200 && typeof repoRoot === "string" && isAbsolute(repoRoot) && body?.id === "space-storage"
+    && root?.path === "/" && app?.path === repoRoot && nonempty(root.deviceId) && nonempty(app.deviceId)
+    && Number.isSafeInteger(app.availableBytes) && app.availableBytes >= 0
+    && Number.isFinite(root.usedPercent) && root.usedPercent >= 0 && root.usedPercent <= 100
+    && body.minimumRecommendedFreeBytes === 20 * 1024 ** 3
+    && typeof body.dedicatedAppVolume === "boolean"
+    && body.dedicatedAppVolume === (root.deviceId !== app.deviceId), "STORAGE_IDENTITY");
+  const expected = !body.dedicatedAppVolume || app.availableBytes < body.minimumRecommendedFreeBytes
+    ? "BLOCKED" : root.usedPercent >= 80 ? "WARN" : "VERIFIED";
+  requireCondition(body.status === expected && nonempty(body.statusReason), "STORAGE_POLICY");
+  return body.status;
 }
 
 /** Reentry derives a separate strong synthetic password; no extra secret file. */
@@ -448,6 +472,9 @@ export async function runAcceptance({ state, timeoutMs = 180000 }) {
     && csrf.body.csrfToken.length <= 512, "CSRF");
   csrfToken = csrf.body.csrfToken;
 
+  const storageReadinessStatus = assertSourceStorage(await request("/api/admin"),
+    await request("/api/admin/storage"), state.repoRoot);
+
   const starter = await request("/api/setup/starter-room", { method: "POST", body: {} });
   const roomId = assertStarterRoom(starter, expectedRoomId);
   const pane = selectStarterPane(await request(`/api/panes?roomId=${encodeURIComponent(roomId)}`), roomId);
@@ -479,6 +506,7 @@ export async function runAcceptance({ state, timeoutMs = 180000 }) {
       scope: "OWNER_HTTP_CLI_WEBSOCKET_ONLY", project: state.project,
       elapsedMs: Math.round(performance.now() - started), ownerClaimedNow,
       ownerLoginVerified: true, csrfMutationVerified: true,
+      adminEndpointVerified: true, configuredStorageRootVerified: true, storageReadinessStatus,
       postgresReady: true, temporalWorkerPollersReady: true, cliHostReady: true,
       starterRoomId: roomId, paneId: pane.id, sessionId: expected.sessionId, runtimeId: RUNTIME,
       sessionStatus: "RUNNING", workspaceCwdVerified: true,

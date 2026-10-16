@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  acceptanceOwner, assertOwner, assertReadiness, assertSession, assertStarterRoom,
-  createTerminalObservation, runAcceptance, selectStarterPane, terminalUrl,
+  acceptanceOwner, assertOwner, assertReadiness, assertSourceStorage, assertSession, assertStarterRoom,
+  createTerminalObservation, runAcceptance, selectStarterPane, sourceStartupTimeoutMs, terminalUrl,
 } from "../dev-stack-acceptance.mjs";
 
 const project = `space-dev-${"a".repeat(24)}`;
@@ -39,12 +40,85 @@ function complete(target) {
   send(target, { type: "pong" });
 }
 
+test("only initial Darwin startup has a twenty-minute cold-start allowance", () => {
+  assert.equal(sourceStartupTimeoutMs("darwin", true), 20 * 60_000);
+  for (const [platform, initial] of [["linux", true], ["linux", false], ["darwin", false]]) {
+    assert.equal(sourceStartupTimeoutMs(platform, initial), 15 * 60_000);
+  }
+  assert.equal(sourceStartupTimeoutMs("darwin"), 15 * 60_000);
+  assert.equal(sourceStartupTimeoutMs("linux"), 15 * 60_000);
+});
+
+test("source startup budget rejects unknown platforms and nonboolean selectors", () => {
+  for (const platform of ["win32", "", null, undefined, {}, ["darwin"]]) {
+    assert.throws(() => sourceStartupTimeoutMs(platform, true), /STARTUP_BUDGET/u);
+  }
+  for (const initial of ["true", 1, null, {}, []]) {
+    assert.throws(() => sourceStartupTimeoutMs("darwin", initial), /STARTUP_BUDGET/u);
+  }
+});
+
+test("CI applies the cold-start selector only to initial readiness, not rebuild", () => {
+  const source = readFileSync(new URL("../dev-stack-ci.mjs", import.meta.url), "utf8");
+  assert.match(source, /async function waitReady\(label, requireCurrentSupervisor = false, timeoutMs = sourceStartupTimeoutMs\(process\.platform\)\)/u);
+  assert.match(source, /await waitReady\("strict source startup", true, sourceStartupTimeoutMs\(process\.platform, true\)\)/u);
+  assert.match(source, /await waitReady\("new rebuilt source supervisor", true\)/u);
+  assert.equal((source.match(/sourceStartupTimeoutMs\(process\.platform, true\)/gu) ?? []).length, 1);
+});
+
 test("readiness requires the actual postgres, workflow pollers and host shape", () => {
   assert.equal(assertReadiness(ready()), true);
 });
 test("HTTP 200 with ok=false never passes readiness", () => {
   const value = ready(); value.body.ok = false;
   assert.throws(() => assertReadiness(value), /NOT_READY/u);
+});
+
+const storageRoot = join(process.cwd(), "synthetic-checkout");
+const admin = () => ({ status: 200, body: { status: "ok", capabilities: [], storageWarning: "" } });
+const storage = (repoRoot = storageRoot) => ({ status: 200, body: { id: "space-storage", status: "BLOCKED", statusReason: "Same device",
+  root: { path: "/", deviceId: "root-device", usedPercent: 25 },
+  app: { path: repoRoot, deviceId: "root-device", availableBytes: 30 * 1024 ** 3 },
+  dedicatedAppVolume: false, minimumRecommendedFreeBytes: 20 * 1024 ** 3 } });
+
+test("source storage accepts same-device BLOCKED rather than inventing production readiness", () => {
+  assert.equal(assertSourceStorage(admin(), storage(), storageRoot), "BLOCKED");
+});
+
+test("source storage retains dedicated-volume low-space and root-pressure policy", () => {
+  const value = storage(); value.body.app.deviceId = "app-device"; value.body.dedicatedAppVolume = true;
+  value.body.app.availableBytes = 1024; value.body.status = "BLOCKED";
+  assert.equal(assertSourceStorage(admin(), value, storageRoot), "BLOCKED");
+  value.body.app.availableBytes = 30 * 1024 ** 3; value.body.root.usedPercent = 85; value.body.status = "WARN";
+  assert.equal(assertSourceStorage(admin(), value, storageRoot), "WARN");
+  value.body.root.usedPercent = 25; value.body.status = "VERIFIED";
+  assert.equal(assertSourceStorage(admin(), value, storageRoot), "VERIFIED");
+});
+
+test("source admin rejects a real HTTP failure and malformed success bodies", () => {
+  for (const response of [{ status: 500, body: null }, { status: 200, body: {} },
+    { status: 200, body: { ...admin().body, storageWarning: "unexpected" } }]) {
+    assert.throws(() => assertSourceStorage(response, storage(), storageRoot), /ADMIN_ENDPOINT/u);
+  }
+});
+
+test("source storage rejects foreign paths, false dedicated flags, missing metadata and changed thresholds", () => {
+  for (const alter of [
+    value => { value.status = 500; }, value => { value.body.app.path = "/opt/spaceapp"; },
+    value => { value.body.dedicatedAppVolume = true; }, value => { value.body.minimumRecommendedFreeBytes = 0; },
+    value => { value.body.app.availableBytes = -1; }, value => { value.body.root.usedPercent = NaN; },
+  ]) {
+    const value = storage(); alter(value);
+    assert.throws(() => assertSourceStorage(admin(), value, storageRoot), /STORAGE_IDENTITY/u);
+  }
+});
+
+test("source storage rejects fake VERIFIED on the root device and exposes no response text in failure", () => {
+  const value = storage(); value.body.status = "VERIFIED"; value.body.statusReason = "synthetic-private-text";
+  assert.throws(() => assertSourceStorage(admin(), value, storageRoot), error => {
+    assert.equal(error.code, "DEV_STACK_ACCEPTANCE_STORAGE_POLICY");
+    assert.equal(error.message.includes("synthetic-private"), false); return true;
+  });
 });
 test("strict health status failure is rejected even if body claims success", () => {
   const value = ready(); value.status = 503;
@@ -326,6 +400,8 @@ test("a web proxy reaching a different owner is rejected before WS attachment", 
       return jsonResponse(body);
     }
     if (url.pathname === "/api/auth/csrf") return jsonResponse({ headerName: "x-space-csrf-token", csrfToken: "s".repeat(32) });
+    if (url.pathname === "/api/admin") return jsonResponse(admin().body);
+    if (url.pathname === "/api/admin/storage") return jsonResponse(storage(syntheticState().repoRoot).body);
     if (options.method === "POST") {
       mutations.push(url.pathname);
       assert.equal(options.headers["x-space-csrf-token"], "s".repeat(32));
@@ -353,3 +429,22 @@ test("a web proxy reaching a different owner is rejected before WS attachment", 
   });
   assert.deepEqual(mutations, ["/api/setup/starter-room", `/api/panes/${encodeURIComponent(expected.paneId)}/cli/session`]);
 });
+
+for (const failure of ["admin500", "foreign-storage-root"]) {
+  test(`source acceptance refuses ${failure} before starter mutations or terminal allocation`, async () => {
+    await withFetchStub(async url => {
+      if (url.pathname === "/readyz") return jsonResponse(ready().body);
+      if (url.pathname === "/api/setup/status") return jsonResponse({ setupRequired: false, expiresAt: null });
+      if (url.pathname === "/api/auth/login") return jsonResponse(auth().body, 200,
+        { "set-cookie": "space_session_dev=synthetic-cookie; HttpOnly; Path=/; SameSite=Lax" });
+      if (url.pathname === "/api/auth/me") return jsonResponse(auth().body);
+      if (url.pathname === "/api/auth/csrf") return jsonResponse({ headerName: "x-space-csrf-token", csrfToken: "s".repeat(32) });
+      if (url.pathname === "/api/admin") return jsonResponse(admin().body, failure === "admin500" ? 500 : 200);
+      if (url.pathname === "/api/admin/storage") return jsonResponse(storage("/foreign-checkout").body);
+      assert.fail("Storage failure must stop before starter mutations/terminal attachment");
+    }, async () => {
+      await assert.rejects(runAcceptance({ state: syntheticState() }),
+        failure === "admin500" ? /ADMIN_ENDPOINT/u : /STORAGE_IDENTITY/u);
+    });
+  });
+}

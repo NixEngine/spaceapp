@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
 import { readState } from "./dev-stack-state.mjs";
 import { processIdentity, signalOwnedGroup, assertGroupsGone, darwinStateCwdProcesses } from "./dev-stack-process.mjs";
-import { runAcceptance, assertReadiness } from "./dev-stack-acceptance.mjs";
+import { runAcceptance, assertReadiness, sourceStartupTimeoutMs } from "./dev-stack-acceptance.mjs";
 import { runBrowserProof } from "./dev-stack-browser.mjs";
 import { runApiReloadProof, runPackageRebuildProof, createOwnedAppendLog, openOwnedAppendLog, readOwnedLog } from "./dev-stack-reload.mjs";
 
@@ -76,7 +76,7 @@ let phase = "STARTUP";
 let primaryFailure;
 let finalReceipt;
 const cleanupFailures = [];
-async function waitReady(label, requireCurrentSupervisor = false) {
+async function waitReady(label, requireCurrentSupervisor = false, timeoutMs = sourceStartupTimeoutMs(process.platform)) {
   await until(async () => {
     if (!existsSync(join(root, ".dev-stack", "owner.json"))) return false;
     try {
@@ -89,10 +89,10 @@ async function waitReady(label, requireCurrentSupervisor = false) {
       const response = await fetch(`http://127.0.0.1:${state.ports.api}/readyz?strict=1`, { signal: AbortSignal.timeout(3000) });
       return assertReadiness({ status: response.status, body: await response.json() });
     } catch { return false; }
-  }, 15 * 60_000, label);
+  }, timeoutMs, label);
 }
 try {
-  await waitReady("strict source startup", true);
+  await waitReady("strict source startup", true, sourceStartupTimeoutMs(process.platform, true));
   phase = "HTTP_CLI_ACCEPTANCE";
   proof = await runAcceptance({ state });
   phase = "BROWSER_UI_HMR";
