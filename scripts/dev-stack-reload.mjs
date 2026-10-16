@@ -1,6 +1,7 @@
 /** Real source-change proofs, restricted to this isolated CI checkout. */
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, lstatSync } from "node:fs";
+import fs from "node:fs";
 import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { assertReadiness } from "./dev-stack-acceptance.mjs";
@@ -11,6 +12,78 @@ const apiAnchor = 'service: "space-api",\n    uptimeSeconds:';
 
 function requireCondition(value, code) {
   if (!value) throw new Error(`DEV_STACK_RELOAD_${code}`);
+}
+
+const maxLogBytes = 8 * 1024 * 1024;
+function requireLog(value, code) {
+  if (!value) {
+    const error = new Error(`DEV_STACK_RELOAD_LOG_${code}`);
+    error.code = `DEV_STACK_RELOAD_LOG_${code}`;
+    throw error;
+  }
+}
+export function assertOwnedLogInfo(info, uid) {
+  requireLog(info.file && !info.symlink && info.nlink === 1n && info.uid === uid &&
+    (info.mode & 0o7777n) === 0o600n && info.size >= 0n && info.size <= BigInt(maxLogBytes), "METADATA");
+}
+function logInfo(stat) {
+  return { file: stat.isFile(), symlink: stat.isSymbolicLink(), nlink: stat.nlink,
+    uid: stat.uid, mode: stat.mode, size: stat.size };
+}
+function logIdentity(stat) { return { dev: stat.dev.toString(), ino: stat.ino.toString() }; }
+function checkedLogStat(path, fd, identity) {
+  requireLog(typeof process.getuid === "function" && fs.constants.O_NOFOLLOW !== undefined, "PLATFORM");
+  requireLog(identity && /^[0-9]{1,30}$/u.test(identity.dev) && /^[0-9]{1,30}$/u.test(identity.ino), "IDENTITY");
+  const stat = fd === undefined ? fs.lstatSync(path, { bigint: true }) : fs.fstatSync(fd, { bigint: true });
+  assertOwnedLogInfo(logInfo(stat), BigInt(process.getuid()));
+  requireLog(stat.dev.toString() === identity.dev && stat.ino.toString() === identity.ino, "IDENTITY");
+  return stat;
+}
+
+/** Create once, but give even the first writer an O_APPEND descriptor. */
+export function createOwnedAppendLog(path) {
+  requireLog(typeof process.getuid === "function" && fs.constants.O_NOFOLLOW !== undefined, "PLATFORM");
+  const fd = fs.openSync(path, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+  let identity;
+  try {
+    const stat = fs.fstatSync(fd, { bigint: true });
+    assertOwnedLogInfo(logInfo(stat), BigInt(process.getuid()));
+    requireLog(stat.size === 0n, "NOT_EMPTY");
+    identity = logIdentity(stat);
+    checkedLogStat(path, undefined, identity);
+  } finally { fs.closeSync(fd); }
+  return openOwnedAppendLog(path, identity);
+}
+
+/** Existing only: no O_CREAT/O_TRUNC, no missing or replacement adoption. */
+export function openOwnedAppendLog(path, identity) {
+  checkedLogStat(path, undefined, identity);
+  const fd = fs.openSync(path, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW);
+  try {
+    checkedLogStat(path, fd, identity); checkedLogStat(path, undefined, identity);
+    return { fd, identity: { ...identity } };
+  } catch (error) { fs.closeSync(fd); throw error; }
+}
+
+/** Snapshot a bounded append-only prefix; concurrent append growth is valid. */
+export function readOwnedLog(path, identity, limit = maxLogBytes) {
+  requireLog(Number.isSafeInteger(limit) && limit >= 0 && limit <= maxLogBytes, "LIMIT");
+  checkedLogStat(path, undefined, identity);
+  const fd = fs.openSync(path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const before = checkedLogStat(path, fd, identity);
+    requireLog(before.size <= BigInt(limit), "LIMIT");
+    const bytes = Buffer.alloc(Number(before.size));
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = fs.readSync(fd, bytes, offset, bytes.length - offset, offset);
+      requireLog(count > 0, "SHRANK"); offset += count;
+    }
+    const after = checkedLogStat(path, fd, identity), named = checkedLogStat(path, undefined, identity);
+    requireLog(after.size >= before.size && named.size >= before.size, "SHRANK");
+    requireLog(after.size <= BigInt(limit) && named.size <= BigInt(limit), "LIMIT");
+    return bytes.toString("utf8");
+  } finally { fs.closeSync(fd); }
 }
 
 export function changedApiSource(original, marker) {

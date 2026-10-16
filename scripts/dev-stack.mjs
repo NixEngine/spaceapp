@@ -18,6 +18,29 @@ import { prepareDevPtyDependency } from "./dev-stack-native.mjs";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const delay = milliseconds => new Promise(done => setTimeout(done, milliseconds));
 
+const observedStepNames = new Set(["Docker prerequisites", "start PostgreSQL and Temporal",
+  "build source and workspace packages", "database migrations", "install pinned state-local OpenCode"]);
+
+/** Fixed-label monotonic progress only; never serialize commands, env or errors. */
+export async function runObservedStep(name, run, { clock = () => performance.now(),
+  emit = record => console.log(JSON.stringify(record)) } = {}) {
+  if (!observedStepNames.has(name) || typeof run !== "function" || typeof clock !== "function" || typeof emit !== "function") {
+    throw new Error("Invalid source-step observation.");
+  }
+  const started = clock();
+  emit({ schema: "spaceapp.dev-stack-step.v1", step: name, event: "START", elapsedMs: 0 });
+  let result;
+  try { result = await run(); }
+  catch (error) {
+    emit({ schema: "spaceapp.dev-stack-step.v1", step: name, event: "FAIL",
+      elapsedMs: Math.max(0, Math.round(clock() - started)) });
+    throw error;
+  }
+  emit({ schema: "spaceapp.dev-stack-step.v1", step: name, event: "END",
+    elapsedMs: Math.max(0, Math.round(clock() - started)) });
+  return result;
+}
+
 export async function waitUntil(predicate, { timeoutMs = 180_000, intervalMs = 250, label = "condition" } = {}) {
   const deadline = performance.now() + timeoutMs;
   do {
@@ -248,7 +271,7 @@ async function up(state, releaseAdmission = () => {}) {
   const step = async (name, command, args, options) => {
     if (stopping) throw new Error("Dev stack interrupted during startup.");
     console.log(`dev-stack: ${name}`);
-    await launch(name, command, args, options).completion;
+    await runObservedStep(name, () => launch(name, command, args, options).completion);
     if (stopping) throw new Error("Dev stack interrupted during startup.");
     if (errors.length) throw errors[0];
   };

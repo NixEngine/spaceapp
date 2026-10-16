@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn, execFileSync } from "node:child_process";
-import { openSync, closeSync, readFileSync, existsSync, readlinkSync, readdirSync } from "node:fs";
+import { closeSync, readFileSync, existsSync, readlinkSync, readdirSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
@@ -8,7 +8,7 @@ import { readState } from "./dev-stack-state.mjs";
 import { processIdentity, signalOwnedGroup, assertGroupsGone, darwinStateCwdProcesses } from "./dev-stack-process.mjs";
 import { runAcceptance, assertReadiness } from "./dev-stack-acceptance.mjs";
 import { runBrowserProof } from "./dev-stack-browser.mjs";
-import { runApiReloadProof, runPackageRebuildProof } from "./dev-stack-reload.mjs";
+import { runApiReloadProof, runPackageRebuildProof, createOwnedAppendLog, openOwnedAppendLog, readOwnedLog } from "./dev-stack-reload.mjs";
 
 // Explicit isolated POSIX CI only. This is not an operator-host diagnostic.
 if (!["linux", "darwin"].includes(process.platform) || process.env.CI !== "true") {
@@ -17,8 +17,12 @@ if (!["linux", "darwin"].includes(process.platform) || process.env.CI !== "true"
 const root = resolve(import.meta.dirname, "..");
 if (existsSync(join(root, ".dev-stack"))) throw new Error("CI proof requires fresh absent dev-stack state.");
 const logPath = join(process.env.RUNNER_TEMP || tmpdir(), `spaceapp-dev-stack-${process.pid}.txt`);
+let ownedLogIdentity;
 function spawnSupervisor(action = "up") {
-  const descriptor = openSync(logPath, action === "up" ? "wx" : "ax", 0o600);
+  if (!["up", "rebuild"].includes(action)) throw new Error("Unexpected source supervisor action.");
+  const log = action === "up" ? createOwnedAppendLog(logPath) : openOwnedAppendLog(logPath, ownedLogIdentity);
+  ownedLogIdentity ??= log.identity;
+  const descriptor = log.fd;
   let child;
   try {
     child = spawn(process.execPath, ["scripts/dev-stack.mjs", action], {
@@ -99,7 +103,7 @@ try {
   phase = "API_WATCH";
   apiReload = await runApiReloadProof({ state });
   phase = "PACKAGE_REBUILD";
-  packageRebuild = await runPackageRebuildProof({ state, readLog: () => readFileSync(logPath, "utf8"),
+  packageRebuild = await runPackageRebuildProof({ state, readLog: () => readOwnedLog(logPath, ownedLogIdentity),
     restart: async () => {
       const old = supervisor;
       const oldState = state;
@@ -126,7 +130,7 @@ try {
   if (!worker || !processIdentity(worker.pid)) throw new Error("No running owned worker to test the failure path.");
   signalOwnedGroup(worker);
   await until(() => supervisor.exit !== undefined, 60_000, "visible worker failure shutdown", false);
-  if (supervisor.exit.code === 0 || !/worker exited unexpectedly/.test(readFileSync(logPath, "utf8"))) {
+  if (supervisor.exit.code === 0 || !/worker exited unexpectedly/.test(readOwnedLog(logPath, ownedLogIdentity))) {
     throw new Error("Worker failure did not produce an explicit failing supervisor outcome.");
   }
   assertGroupsGone(receipts);
