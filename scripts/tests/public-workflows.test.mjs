@@ -46,15 +46,23 @@ test("the macOS native control keeps original tests and cannot start or repair t
   assert.match(job, /ELECTRON_SKIP_BINARY_DOWNLOAD: "1"/);
   assert.match(job, /run: npm ci/);
   const build = job.indexOf("run: npm run build -w @space/cli-host");
-  const tests = job.indexOf("run: npm run test:contributor");
+  const tests = job.indexOf("['--test', 'scripts/tests/contributor-smoke.test.mjs']");
   assert.ok(build >= 0 && tests >= 0 && build < tests);
-  assert.doesNotMatch(job, /continue-on-error|--ignore-scripts|chmod|colima|brew|upload-artifact|dev-stack-ci|process\.env/);
+  assert.doesNotMatch(job, /continue-on-error|--ignore-scripts|colima|brew|upload-artifact|dev-stack-ci|chmodSync\(helper/);
   for (const ref of job.matchAll(/uses:\s+([^\s]+)/g)) assert.match(ref[1], /@[0-9a-f]{40}$/);
   const metadata = job.match(/node --input-type=commonjs <<'NODE'\n([\s\S]*?)\n          NODE/)[1]
     .split("\n").map(line => line.slice(10)).join("\n");
   assert.doesNotThrow(() => new Function(metadata));
   assert.match(metadata, /path\.relative\(root, binding\)/);
   assert.match(metadata, /fs\.accessSync\(helper, fs\.constants\.X_OK\)/);
+  const control = job.match(/node --input-type=commonjs <<'CONTROL'\n([\s\S]*?)\n          CONTROL/)[1]
+    .split("\n").map(line => line.slice(10)).join("\n");
+  assert.doesNotThrow(() => new Function(control));
+  assert.match(control, /fs\.constants\.O_NOFOLLOW/);
+  assert.match(control, /stat\.nlink === 1 && stat\.uid === process\.getuid\(\)/);
+  assert.match(control, /fs\.fchmodSync\(fd, originalMode \| 0o100\)/);
+  assert.match(control, /finally \{\n\s+fs\.fchmodSync\(fd, originalMode\)/);
+  assert.match(control, /assert\.equal\(digest\(\), originalHash\)/);
 });
 
 test("CI creates and validates only the sanitized public candidate", async () => {

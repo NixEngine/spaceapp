@@ -181,5 +181,98 @@ jobs:
           NODE
       - name: Build only the original CLI host workspace
         run: npm run build -w @space/cli-host
-      - name: Original synthetic-runtime real PTY IPC positive and negative controls
-        run: npm run test:contributor
+      - name: Original PTY tests before and after one reversible owner-execute bit
+        run: |
+          node --input-type=commonjs <<'CONTROL'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const crypto = require('node:crypto');
+          const { spawnSync } = require('node:child_process');
+          assert.equal(process.platform, 'darwin');
+          assert.equal(require('node-pty/package.json').version, '1.1.0');
+          require('node-pty');
+          const checkout = fs.realpathSync(process.cwd());
+          const packageRoot = path.dirname(require.resolve('node-pty/package.json'));
+          const allowedRoot = fs.realpathSync(path.join(checkout, 'node_modules', 'node-pty'));
+          assert.equal(packageRoot, allowedRoot);
+          const bindings = Object.keys(require.cache).filter(file =>
+            file.startsWith(packageRoot + path.sep) && file.endsWith('.node'));
+          assert.equal(bindings.length, 1);
+          const helper = path.join(path.dirname(bindings[0]), 'spawn-helper');
+          assert.ok(helper.startsWith(allowedRoot + path.sep));
+          assert.equal(fs.realpathSync(helper), helper);
+          const executable = () => {
+            try { fs.accessSync(helper, fs.constants.X_OK); return true; }
+            catch (error) { if (error.code !== 'EACCES') throw error; return false; }
+          };
+          const fd = fs.openSync(helper, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+          try {
+            const stat = fs.fstatSync(fd);
+            assert.ok(stat.isFile() && stat.nlink === 1 && stat.uid === process.getuid());
+            assert.ok(stat.size > 0 && stat.size <= 8 * 1024 * 1024);
+            const originalMode = stat.mode & 0o7777;
+            assert.equal(originalMode, 0o644);
+            assert.equal(executable(), false);
+            const digest = () => {
+              const current = fs.fstatSync(fd);
+              const named = fs.lstatSync(helper);
+              assert.ok(named.isFile() && !named.isSymbolicLink());
+              assert.equal(named.dev, stat.dev); assert.equal(named.ino, stat.ino);
+              assert.equal(current.size, stat.size);
+              const bytes = Buffer.alloc(stat.size);
+              assert.equal(fs.readSync(fd, bytes, 0, bytes.length, 0), bytes.length);
+              return crypto.createHash('sha256').update(bytes).digest('hex');
+            };
+            const originalHash = digest();
+            const run = phase => {
+              const result = spawnSync(process.execPath,
+                ['--test', 'scripts/tests/contributor-smoke.test.mjs'],
+                { cwd: checkout, env: process.env, encoding: 'utf8', timeout: 30000, maxBuffer: 262144 });
+              process.stdout.write(`=== ${phase}: unchanged original tests ===\n`);
+              process.stdout.write(result.stdout || '');
+              process.stderr.write(result.stderr || '');
+              assert.equal(result.error, undefined);
+              assert.equal(result.signal, null);
+              assert.match(result.stdout, /^# tests 3$/m);
+              return result;
+            };
+            const baseline = run('BEFORE');
+            assert.equal(baseline.status, 1);
+            assert.match(baseline.stdout, /^# pass 0$/m);
+            assert.match(baseline.stdout, /^# fail 3$/m);
+            assert.match(baseline.stdout, /posix_spawnp failed\./);
+            assert.equal(digest(), originalHash);
+            try {
+              // Descriptor-only: one owned regular file, no recursive/path chmod.
+              fs.fchmodSync(fd, originalMode | 0o100);
+              assert.equal(fs.fstatSync(fd).mode & 0o777, 0o744);
+              assert.equal(digest(), originalHash);
+              assert.equal(executable(), true);
+              const after = run('AFTER_OWNER_EXECUTE');
+              assert.equal(after.status, 0);
+              assert.match(after.stdout, /^# pass 3$/m);
+              assert.match(after.stdout, /^# fail 0$/m);
+            } finally {
+              fs.fchmodSync(fd, originalMode);
+              assert.equal(fs.fstatSync(fd).mode & 0o777, originalMode);
+              assert.equal(digest(), originalHash);
+              assert.equal(executable(), false);
+              console.log(JSON.stringify({ phase: 'RESTORED', mode: '644', helperSha256: originalHash }));
+            }
+            const reversed = run('AFTER_RESTORE');
+            assert.equal(reversed.status, 1);
+            assert.match(reversed.stdout, /^# pass 0$/m);
+            assert.match(reversed.stdout, /^# fail 3$/m);
+            assert.match(reversed.stdout, /posix_spawnp failed\./);
+            assert.equal(digest(), originalHash);
+            assert.equal(fs.fstatSync(fd).mode & 0o7777, originalMode);
+            assert.equal(executable(), false);
+            console.log(JSON.stringify({ mode: 'REVERSIBLE_NATIVE_HELPER_CONTROL',
+              runtime: 'SIMULATED_RUNTIME', transport: 'REAL_PTY_UNIX_IPC',
+              beforeMode: '644', trialMode: '744', restoredMode: '644',
+              helperSha256: originalHash, sourceBytesUnchanged: true, modeRestored: true,
+              before: { pass: 0, fail: 3 }, ownerExecute: { pass: 3, fail: 0 },
+              restored: { pass: 0, fail: 3 }, passed: true }));
+          } finally { fs.closeSync(fd); }
+          CONTROL

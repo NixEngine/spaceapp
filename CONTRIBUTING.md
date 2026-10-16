@@ -148,6 +148,16 @@ negative controls. No Docker, API, browser, OpenCode install or provider is
 started by this job. An executable helper or successful native import alone
 does not prove that a PTY can start.
 
+Following the observed non-executable helper and native test failure, the
+diagnostic job requires that exact failing baseline, then changes **only** the
+owner-execute bit on the one pinned runner-owned helper through an open
+no-follow descriptor. It reruns the unchanged tests and always restores the
+original mode and verifies unchanged bytes. This is a bounded counterfactual,
+not an automatic repair or a reason to chmod host/dependency trees. Different
+baseline conditions fail explicitly rather than being silently repaired.
+After restoration, the same native failure must recur (A/B/A control); success
+requires the exact failing/passing/failing sequence and unchanged helper bytes.
+
 Its result concerns a **simulated runtime over real PTY/Unix IPC** only, not
 the source-stack terminal failure's historical cause or full issue acceptance.
 Ordinary feature pushes, pull requests and manual workflow runs retain the
