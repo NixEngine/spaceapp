@@ -14,6 +14,7 @@ import { processIdentity, sameProcess, signalOwnedGroup, signalOwnedProcess, ass
 import { openCodeWrapper } from "./dev-stack-wrapper.mjs";
 import { acquireLifecycleLock, releaseLifecycleLock } from "./dev-stack-lifecycle.mjs";
 import { prepareDevPtyDependency } from "./dev-stack-native.mjs";
+import { cleanupFailureRecord } from "./dev-stack-diagnostics.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const delay = milliseconds => new Promise(done => setTimeout(done, milliseconds));
@@ -336,23 +337,28 @@ async function up(state, releaseAdmission = () => {}) {
   } finally {
     stopping = true;
     const cleanupErrors = [];
+    const recordCleanupFailure = (stage, error, childName) => {
+      cleanupErrors.push(error); // Preserve the original failure, not its diagnostic projection.
+      console.error(JSON.stringify(cleanupFailureRecord({ stage, error, ...(childName ? { childName } : {}) })));
+    };
     if (ownershipLost) cleanupErrors.push(new Error("A launched child's process identity was not established; retain receipts for recovery."));
     for (const record of receipts) {
-      try { signalOwnedGroup(record); } catch (error) { cleanupErrors.push(error); }
+      try { signalOwnedGroup(record); }
+      catch (error) { recordCleanupFailure("SIGNAL_CHILD_GROUP", error, record.name); }
     }
     try {
       await waitUntil(() => {
         try { assertGroupsGone(receipts); return true; }
         catch (error) { if (!error.message.includes("remains")) throw error; return false; }
       }, { timeoutMs: 10_000, label: "child shutdown" });
-    } catch (error) { cleanupErrors.push(error); }
+    } catch (error) { recordCleanupFailure("WAIT_CHILD_GROUPS", error); }
     try {
       if (existsSync(location.compose)) {
         validateOwnedCompose(state);
         dockerOutput(state, composeArguments(state, "down", "--remove-orphans"));
         assertDockerGone(state, false);
       }
-    } catch (error) { cleanupErrors.push(error); }
+    } catch (error) { recordCleanupFailure("DOCKER_SHUTDOWN", error); }
     process.off("SIGTERM", stop);
     process.off("SIGINT", stop);
     if (cleanupErrors.length) {

@@ -76,6 +76,26 @@ test("source-step observation rejects arbitrary labels before executing work", a
   assert.equal(called, false);
 });
 
+test("cleanup-stage diagnostics are additive and retain the original aggregate failure", () => {
+  const source = readFileSync(new URL("../dev-stack.mjs", import.meta.url), "utf8");
+  assert.match(source, /cleanupErrors\.push\(error\); \/\/ Preserve the original failure/);
+  for (const stage of ["SIGNAL_CHILD_GROUP", "WAIT_CHILD_GROUPS", "DOCKER_SHUTDOWN"]) {
+    assert.ok(source.includes(`recordCleanupFailure("${stage}", error`));
+  }
+  assert.match(source, /throw new AggregateError\(cleanupErrors,/);
+  assert.match(source, /timeoutMs: 10_000, label: "child shutdown"/);
+  assert.match(source, /cleanupFailureRecord\(\{ stage, error,/);
+});
+
+test("CI observes old/current supervisor exits without accepting a signalled or unobserved exit", () => {
+  const source = readFileSync(new URL("../dev-stack-ci.mjs", import.meta.url), "utf8");
+  assert.match(source, /supervisorExitRecord\(old\.exit\), event: "REBUILD_OLD_EXIT", observed: true/);
+  assert.match(source, /if \(old\.exit\.code !== 0\) throw new Error/);
+  assert.match(source, /supervisorExitRecord\(supervisor\.exit\)/);
+  assert.match(source, /event: "FINAL_CURRENT_EXIT", observed: supervisor\.exit !== undefined/);
+  assert.match(source, /cleanupVerified: cleanupFailures\.length === 0/);
+});
+
 test("cleanup rejects a compose swap naming a foreign volume, service or image", () => {
   const repoRoot = resolve("synthetic-repo");
   const state = { repoRoot, stateDir: join(repoRoot, ".dev-stack"), project: `space-dev-${"1".repeat(24)}`,

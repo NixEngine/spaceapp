@@ -384,6 +384,8 @@ test("the documented contributor path is exported", () => {
     "scripts/dev-stack.mjs",
     "scripts/dev-stack-native.mjs",
     "scripts/tests/dev-stack-native.test.mjs",
+    "scripts/dev-stack-diagnostics.mjs",
+    "scripts/tests/dev-stack-diagnostics.test.mjs",
     "scripts/dev-stack-state.mjs",
     "scripts/dev-stack-config.mjs",
     "scripts/dev-stack-process.mjs",

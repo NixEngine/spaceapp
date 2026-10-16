@@ -9,6 +9,7 @@ import { processIdentity, signalOwnedGroup, assertGroupsGone, darwinStateCwdProc
 import { runAcceptance, assertReadiness, sourceStartupTimeoutMs } from "./dev-stack-acceptance.mjs";
 import { runBrowserProof } from "./dev-stack-browser.mjs";
 import { runApiReloadProof, runPackageRebuildProof, createOwnedAppendLog, openOwnedAppendLog, readOwnedLog } from "./dev-stack-reload.mjs";
+import { supervisorExitRecord } from "./dev-stack-diagnostics.mjs";
 
 // Explicit isolated POSIX CI only. This is not an operator-host diagnostic.
 if (!["linux", "darwin"].includes(process.platform) || process.env.CI !== "true") {
@@ -110,6 +111,7 @@ try {
       const oldRuntime = JSON.parse(readFileSync(join(state.stateDir, "runtime.json"), "utf8"));
       supervisor = spawnSupervisor("rebuild");
       await until(() => old.exit !== undefined, 120_000, "old supervisor exits for documented rebuild");
+      console.error(JSON.stringify({ ...supervisorExitRecord(old.exit), event: "REBUILD_OLD_EXIT", observed: true }));
       if (old.exit.code !== 0) throw new Error("Rebuild did not stop the original supervisor cleanly.");
       assertGroupsGone(oldRuntime.children);
       await waitReady("new rebuilt source supervisor", true);
@@ -169,6 +171,8 @@ try {
   if (state && existsSync(state.stateDir)) {
     try { reset(); } catch (error) { cleanupFailures.push(error); }
   }
+  console.error(JSON.stringify({ ...supervisorExitRecord(supervisor.exit),
+    event: "FINAL_CURRENT_EXIT", observed: supervisor.exit !== undefined }));
   console.log(`Source-stack log: ${logPath}`);
 }
 if (primaryFailure || cleanupFailures.length) {

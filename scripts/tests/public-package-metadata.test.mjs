@@ -38,7 +38,8 @@ const publicTestModules = [
   "dev-stack-lifecycle.test.mjs",
   "dev-stack-browser.test.mjs",
   "dev-stack-reload.test.mjs",
-  "dev-stack-native.test.mjs"
+  "dev-stack-native.test.mjs",
+  "dev-stack-diagnostics.test.mjs"
 ];
 
 async function packageFiles(directory) {
