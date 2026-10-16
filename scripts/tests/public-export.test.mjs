@@ -382,6 +382,8 @@ test("public export fails when CONTRIBUTING sends contributors to a script or fi
 test("the documented contributor path is exported", () => {
   for (const path of [
     "scripts/dev-stack.mjs",
+    "scripts/dev-stack-native.mjs",
+    "scripts/tests/dev-stack-native.test.mjs",
     "scripts/dev-stack-state.mjs",
     "scripts/dev-stack-config.mjs",
     "scripts/dev-stack-process.mjs",

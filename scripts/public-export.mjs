@@ -80,6 +80,8 @@ export const publicRepositoryMaintainedFiles = new Set(["docs/security-model.md"
 const publicScripts = new Set([
   // Complete source contributor stack; runtime/credentials remain git-ignored.
   "scripts/dev-stack.mjs",
+  "scripts/dev-stack-native.mjs",
+  "scripts/tests/dev-stack-native.test.mjs",
   "scripts/dev-stack-state.mjs",
   "scripts/dev-stack-config.mjs",
   "scripts/dev-stack-process.mjs",

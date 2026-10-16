@@ -27,3 +27,4 @@ import "./dev-stack-runner.test.mjs";
 import "./dev-stack-lifecycle.test.mjs";
 import "./dev-stack-browser.test.mjs";
 import "./dev-stack-reload.test.mjs";
+import "./dev-stack-native.test.mjs";

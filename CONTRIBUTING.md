@@ -73,6 +73,18 @@ is refused, and no Windows feature, WSL distribution or daemon is installed by
 the stack. Keep the checkout path short enough for the Unix CLI socket
 `.dev-stack/h.sock` (at most100bytes); do not use an existing operator socket.
 
+Before starting or rebuilding on macOS, the development bootstrap checks the
+locked `node-pty@1.1.0` actually loaded from this checkout. Its published helper
+can be present as0644, which imports successfully but cannot spawn a PTY. Only
+that bounded regular, single-link, current-user-owned adjacent helper may gain
+the owner-execute bit (0644 to0744), through a no-follow descriptor with inode,
+mode and unchanged-content verification. Safe already-executable helpers are
+left untouched. Unexpected versions, links, ownership or permissions fail
+explicitly; nothing is installed/upgraded or recursively chmodded. Linux is a
+no-op; the normal product runtime is unchanged. `down/reset/verify` do not run
+this prerequisite. Reset removes the development state, not installed npm
+dependencies or this retained prerequisite mode; `npm ci` reinstalls them.
+
 Readiness requires `/readyz?strict=1`, HTTP200 **and** `ok:true` with PostgreSQL,
 worker and CLI host RUNNING. The supervisor reports a child exit and stops the
 other owned children; Docker failures are failures, not successful cleanup.

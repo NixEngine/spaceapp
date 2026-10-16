@@ -13,6 +13,7 @@ import { resolvePorts, readImages, readOpenCodeVersion, composeConfig, serviceEn
 import { processIdentity, sameProcess, signalOwnedGroup, signalOwnedProcess, assertGroupsGone } from "./dev-stack-process.mjs";
 import { openCodeWrapper } from "./dev-stack-wrapper.mjs";
 import { acquireLifecycleLock, releaseLifecycleLock } from "./dev-stack-lifecycle.mjs";
+import { prepareDevPtyDependency } from "./dev-stack-native.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const delay = milliseconds => new Promise(done => setTimeout(done, milliseconds));
@@ -356,10 +357,21 @@ export async function main(args = process.argv.slice(2)) {
     if (!released) { releaseLifecycleLock(admission); released = true; }
   };
   try {
-    if (action === "up") return await up(initState(repoRoot, resolvePorts(process.env)), release);
+    if (action === "up") {
+      const ports = resolvePorts(process.env);
+      if (existsSync(join(repoRoot, ".dev-stack"))) {
+        const existing = readState(repoRoot);
+        if (existsSync(paths(existing).lock)) throw new Error("Dev stack is already running or has retained recovery state; inspect down/reset before starting.");
+      }
+      console.log(`dev-stack native prerequisite: ${JSON.stringify(prepareDevPtyDependency(repoRoot))}`);
+      return await up(initState(repoRoot, ports), release);
+    }
     const state = readState(repoRoot);
     if (action === "down" || action === "reset") return await stopState(state, action === "reset");
-    if (action === "rebuild") { await stopState(state); return await up(state, release); }
+    if (action === "rebuild") {
+      console.log(`dev-stack native prerequisite: ${JSON.stringify(prepareDevPtyDependency(state.repoRoot))}`);
+      await stopState(state); return await up(state, release);
+    }
     const { runAcceptance } = await import("./dev-stack-acceptance.mjs");
     console.log(JSON.stringify(await runAcceptance({ state }), null, 2));
   } finally { release(); }
