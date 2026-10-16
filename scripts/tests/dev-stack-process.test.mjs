@@ -3,9 +3,64 @@ import assert from "node:assert/strict";
 import { sameProcess, signalOwnedGroup, signalOwnedProcess, processIdentity, assertGroupsGone,
   createShutdownSignals, waitGroupsGone, verifyShutdownGroups } from "../dev-stack-process.mjs";
 import { parseCwdRecords, darwinStateCwdProcesses } from "../dev-stack-process.mjs";
+import { parseDarwinProcessIdentity } from "../dev-stack-process.mjs";
+import { createHash } from "node:crypto";
 import { resolve, join } from "node:path";
 
 const original = { pid: 23001, pgid: 23001, startId: "boot:12345" };
+
+const darwinBirth = "Fri Oct 16 21:42:00 2026";
+const darwinCommand = "/opt/node/bin/node scripts/dev-stack.mjs";
+const commandDigest = value => createHash("sha256").update(value).digest("hex");
+
+test("Darwin live parsing retains the original birth and command fingerprint", () => {
+  const observed = parseDarwinProcessIdentity(23001, `  Ss+ 23001 ${darwinBirth} ${darwinCommand}\n`);
+  assert.deepEqual(observed, { pid: 23001, pgid: 23001,
+    startId: `${darwinBirth}:${commandDigest(darwinCommand)}` });
+  assert.equal(sameProcess(observed, { ...observed }), true);
+});
+
+test("Darwin zombies are not misreported as reused live identities after command replacement", () => {
+  const live = parseDarwinProcessIdentity(23001, `S 23001 ${darwinBirth} ${darwinCommand}`);
+  // Modelled ps output, not a claim that the historical runner captured this row.
+  const legacyZombieFingerprint = `${darwinBirth}:${commandDigest("<defunct>")}`;
+  assert.notEqual(legacyZombieFingerprint, live.startId);
+  for (const state of ["Z", "Z+", "Zs"]) {
+    assert.equal(parseDarwinProcessIdentity(23001, `${state} 23001 ${darwinBirth} <defunct>`), null);
+  }
+});
+
+test("Darwin live birth, command and process-group changes still refuse signalling", () => {
+  const receipt = parseDarwinProcessIdentity(23001, `S 23001 ${darwinBirth} ${darwinCommand}`);
+  for (const row of [`S 23001 Fri Oct 16 21:42:01 2026 ${darwinCommand}`,
+    `S 23001 ${darwinBirth} foreign-command`, `S 23002 ${darwinBirth} ${darwinCommand}`]) {
+    const observed = parseDarwinProcessIdentity(23001, row);
+    assert.equal(sameProcess(receipt, observed), false);
+    assert.throws(() => signalOwnedProcess(receipt, "SIGTERM", {
+      inspect: () => observed, kill: () => assert.fail("never signal a changed live identity")
+    }), /creation identity changed/u);
+  }
+});
+
+test("Darwin zombie leader is never signalled and does not certify descendant-group absence", () => {
+  const receipt = parseDarwinProcessIdentity(23001, `S 23001 ${darwinBirth} ${darwinCommand}`);
+  const inspect = () => parseDarwinProcessIdentity(23001, `Z 23001 ${darwinBirth} <defunct>`);
+  assert.equal(signalOwnedProcess(receipt, "SIGKILL", { inspect,
+    kill: () => assert.fail("never signal a zombie leader") }), false);
+  assert.equal(signalOwnedGroup(receipt, "SIGTERM", { inspect,
+    kill: () => assert.fail("never infer group ownership from dead leader") }), false);
+  assert.throws(() => assertGroupsGone([receipt], { kill: () => {} }), /remains/u);
+});
+
+test("Darwin malformed, missing and oversized observations fail closed", () => {
+  for (const row of ["", `23001 ${darwinBirth} ${darwinCommand}`, `S 1 ${darwinBirth} ${darwinCommand}`,
+    `S 23001 short-date ${darwinCommand}`, `S 23001 ${darwinBirth} first\nsecond`, "x".repeat(65_537)]) {
+    assert.throws(() => parseDarwinProcessIdentity(23001, row), /creation identity/u);
+  }
+  for (const pid of [0, 1, "23001", 2.5]) {
+    assert.throws(() => parseDarwinProcessIdentity(pid, `Z 23001 ${darwinBirth} <defunct>`), /creation identity/u);
+  }
+});
 
 test("NUL cwd records bind each path to its PID and exclude sibling prefixes", () => {
   const state = resolve("isolated state");

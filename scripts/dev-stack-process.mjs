@@ -54,6 +54,20 @@ export function darwinStateCwdProcesses(stateDir, { execute = spawnSync, uid = p
   return parseCwdRecords(observed.stdout, stateDir);
 }
 
+/** A zombie has no live identity; its displayed command can already be <defunct>. */
+export function parseDarwinProcessIdentity(pid, output) {
+  if (!Number.isSafeInteger(pid) || pid <= 1 || typeof output !== "string" || output.length > 65_536) {
+    throw new Error("Cannot establish process creation identity.");
+  }
+  const match = /^([A-Za-z][A-Za-z<>+\-]*)\s+([1-9][0-9]*)\s+(.{24})\s+([^\r\n]+)$/u.exec(output.trim());
+  const pgid = match ? Number(match[2]) : NaN;
+  if (!match || !Number.isSafeInteger(pgid) || pgid <= 1) {
+    throw new Error("Cannot establish process creation identity.");
+  }
+  if (match[1].startsWith("Z")) return null;
+  return { pid, pgid, startId: `${match[3]}:${digest(match[4])}` };
+}
+
 /** Local process ownership, not authorization against a hostile same-user writer. */
 export function processIdentity(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error("Invalid managed process PID.");
@@ -66,12 +80,10 @@ export function processIdentity(pid) {
       return { pid, pgid: Number(fields[2]), startId: `${boot}:${fields[19]}` };
     }
     if (process.platform === "darwin") {
-      const output = execFileSync("ps", ["-p", String(pid), "-o", "pgid=", "-o", "lstart=", "-o", "command="], {
+      const output = execFileSync("ps", ["-p", String(pid), "-o", "stat=", "-o", "pgid=", "-o", "lstart=", "-o", "command="], {
         encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 3000
-      }).trim();
-      const match = /^(\d+)\s+(.{24})\s+(.+)$/.exec(output);
-      if (!match) throw new Error("Cannot establish process creation identity.");
-      return { pid, pgid: Number(match[1]), startId: `${match[2]}:${digest(match[3])}` };
+      });
+      return parseDarwinProcessIdentity(pid, output);
     }
     throw new Error("The dev stack uses Unix process groups; run Windows inside WSL2.");
   } catch (error) {
