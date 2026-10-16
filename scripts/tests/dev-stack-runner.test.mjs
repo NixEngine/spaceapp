@@ -88,6 +88,20 @@ test("cleanup-stage diagnostics are additive and retain the original aggregate f
   assert.match(source, /cleanupFailureRecord\(\{ stage, error,/);
 });
 
+test("CLI identity refusal emits only its local safe record while keeping the fixed error and exit", () => {
+  const source = readFileSync(new URL("../dev-stack.mjs", import.meta.url), "utf8");
+  const processSource = readFileSync(new URL("../dev-stack-process.mjs", import.meta.url), "utf8");
+  assert.ok(source.includes('processIdentity(runtime.supervisor.pid, "SUPERVISOR_SHUTDOWN_WAIT")'));
+  assert.ok(processSource.includes('inspect = pid => processIdentity(pid, "SUPERVISOR_SIGNAL")'));
+  const entry = source.slice(source.indexOf("  main().catch(error => {"));
+  const getter = entry.indexOf("processIdentityFailureDiagnostic(error)");
+  const diagnostic = entry.indexOf("if (diagnostic) console.error(JSON.stringify(diagnostic));");
+  const originalMessage = entry.indexOf("console.error(`dev-stack failed: ${error.message}`);");
+  assert.ok(getter >= 0 && diagnostic > getter && originalMessage > diagnostic);
+  assert.ok(entry.includes("process.exitCode = 1;"));
+  assert.ok(!entry.includes("error.cause") && !entry.includes("error.diagnostic"));
+});
+
 test("source shutdown shares one signal coordinator, strict group wait and scoped up handoff", () => {
   const source = readFileSync(new URL("../dev-stack.mjs", import.meta.url), "utf8");
   assert.match(source, /const shutdown = createShutdownSignals\(\)/);

@@ -6,6 +6,38 @@ import { performance } from "node:perf_hooks";
 
 const digest = value => createHash("sha256").update(value).digest("hex");
 
+const identityFailures = new WeakMap();
+const observationContexts = new Set(["UNSPECIFIED", "SUPERVISOR_SIGNAL", "SUPERVISOR_SHUTDOWN_WAIT"]);
+
+/** Same failed input, fixed scalar structure only; never retain a PID or ps text. */
+function darwinIdentityFailure(pid, output, stage, context, match = null) {
+  const error = new Error("Cannot establish process creation identity.");
+  const bounded = typeof output === "string" && output.length <= 65_536;
+  const row = bounded ? output.trim() : null;
+  const group = match ? Number(match[2]) : null;
+  identityFailures.set(error, Object.freeze({
+    schema: "spaceapp.dev-stack-process-observation-failure.v1",
+    context: observationContexts.has(context) ? context : "UNSPECIFIED",
+    stage,
+    pidValid: Number.isSafeInteger(pid) && pid > 1,
+    outputKind: typeof output === "string" ? "STRING" : (output === null ? "NULL" : "OTHER"),
+    codeUnits: typeof output === "string" ? Math.min(output.length, 65_537) : null,
+    trimmedLineClass: row === null ? "UNOBSERVED" : (row === "" ? "EMPTY" : (/[\r\n]/u.test(row) ? "MULTIPLE" : "ONE")),
+    rowMatched: stage === "ROW" ? match !== null : null,
+    leadingColumnsShape: row === null ? null : /^[A-Za-z][A-Za-z<>+\-]*\s+[1-9][0-9]*\s+/u.test(row),
+    groupFieldClass: match === null ? "UNOBSERVED" : (Number.isSafeInteger(group) && group > 1 ? "SAFE_PRIVATE_GROUP" : "NOT_SAFE_PRIVATE_GROUP"),
+    stateMarkerClass: match === null ? "UNOBSERVED" : (match[1].startsWith("Z") ? "Z_PREFIX" : "NON_Z_PREFIX"),
+    birthWidth24: match === null ? null : true,
+    commandPresent: match === null ? null : true,
+  }));
+  return error;
+}
+
+/** No property/cause/aggregate traversal and no global mutable last observation. */
+export function processIdentityFailureDiagnostic(error) {
+  return identityFailures.get(error) ?? null;
+}
+
 /** Parse lsof's explicit p/f/n fields; NUL protects spaces and newlines. */
 export function parseCwdRecords(output, stateDir) {
   if (typeof output !== "string" || !isAbsolute(stateDir) || output.length > 8 * 1024 * 1024) {
@@ -55,21 +87,21 @@ export function darwinStateCwdProcesses(stateDir, { execute = spawnSync, uid = p
 }
 
 /** A zombie has no live identity; its displayed command can already be <defunct>. */
-export function parseDarwinProcessIdentity(pid, output) {
+export function parseDarwinProcessIdentity(pid, output, observationContext = "UNSPECIFIED") {
   if (!Number.isSafeInteger(pid) || pid <= 1 || typeof output !== "string" || output.length > 65_536) {
-    throw new Error("Cannot establish process creation identity.");
+    throw darwinIdentityFailure(pid, output, "INPUT", observationContext);
   }
   const match = /^([A-Za-z][A-Za-z<>+\-]*)\s+([1-9][0-9]*)\s+(.{24})\s+([^\r\n]+)$/u.exec(output.trim());
   const pgid = match ? Number(match[2]) : NaN;
   if (!match || !Number.isSafeInteger(pgid) || pgid <= 1) {
-    throw new Error("Cannot establish process creation identity.");
+    throw darwinIdentityFailure(pid, output, "ROW", observationContext, match);
   }
   if (match[1].startsWith("Z")) return null;
   return { pid, pgid, startId: `${match[3]}:${digest(match[4])}` };
 }
 
 /** Local process ownership, not authorization against a hostile same-user writer. */
-export function processIdentity(pid) {
+export function processIdentity(pid, observationContext = "UNSPECIFIED") {
   if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error("Invalid managed process PID.");
   try {
     if (process.platform === "linux") {
@@ -83,7 +115,7 @@ export function processIdentity(pid) {
       const output = execFileSync("ps", ["-p", String(pid), "-o", "stat=", "-o", "pgid=", "-o", "lstart=", "-o", "command="], {
         encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 3000
       });
-      return parseDarwinProcessIdentity(pid, output);
+      return parseDarwinProcessIdentity(pid, output, observationContext);
     }
     throw new Error("The dev stack uses Unix process groups; run Windows inside WSL2.");
   } catch (error) {
@@ -99,7 +131,7 @@ export function sameProcess(record, observed) {
 }
 
 /** Supervisor shares its caller's group: signal only its positively identified PID. */
-export function signalOwnedProcess(record, signal = "SIGTERM", { inspect = processIdentity, kill = process.kill } = {}) {
+export function signalOwnedProcess(record, signal = "SIGTERM", { inspect = pid => processIdentity(pid, "SUPERVISOR_SIGNAL"), kill = process.kill } = {}) {
   if (!["SIGTERM", "SIGKILL"].includes(signal)) throw new Error("Unsupported teardown signal.");
   const current = inspect(record?.pid);
   if (!current) return false;

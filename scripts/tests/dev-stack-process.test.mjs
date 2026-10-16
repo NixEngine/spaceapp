@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { sameProcess, signalOwnedGroup, signalOwnedProcess, processIdentity, assertGroupsGone,
   createShutdownSignals, waitGroupsGone, verifyShutdownGroups } from "../dev-stack-process.mjs";
 import { parseCwdRecords, darwinStateCwdProcesses } from "../dev-stack-process.mjs";
-import { parseDarwinProcessIdentity } from "../dev-stack-process.mjs";
+import { parseDarwinProcessIdentity, processIdentityFailureDiagnostic } from "../dev-stack-process.mjs";
 import { createHash } from "node:crypto";
 import { resolve, join } from "node:path";
 
@@ -12,6 +12,74 @@ const original = { pid: 23001, pgid: 23001, startId: "boot:12345" };
 const darwinBirth = "Fri Oct 16 21:42:00 2026";
 const darwinCommand = "/opt/node/bin/node scripts/dev-stack.mjs";
 const commandDigest = value => createHash("sha256").update(value).digest("hex");
+
+function captureIdentityRefusal(pid, output, context) {
+  let caught;
+  try { parseDarwinProcessIdentity(pid, output, context); }
+  catch (error) { caught = error; }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.message, "Cannot establish process creation identity.");
+  return { error: caught, diagnostic: processIdentityFailureDiagnostic(caught) };
+}
+
+test("Darwin refusal records the same input branch and fixed structure, not guessed fields", () => {
+  const input = captureIdentityRefusal(1, "", "SUPERVISOR_SIGNAL").diagnostic;
+  assert.equal(input.stage, "INPUT"); assert.equal(input.pidValid, false);
+  assert.equal(input.rowMatched, null); assert.equal(input.context, "SUPERVISOR_SIGNAL");
+  const empty = captureIdentityRefusal(23001, " \n", "SUPERVISOR_SHUTDOWN_WAIT").diagnostic;
+  assert.equal(empty.stage, "ROW"); assert.equal(empty.trimmedLineClass, "EMPTY");
+  assert.equal(empty.codeUnits, 2); assert.equal(empty.rowMatched, false);
+  assert.equal(empty.groupFieldClass, "UNOBSERVED"); assert.equal(empty.birthWidth24, null);
+  assert.equal(empty.context, "SUPERVISOR_SHUTDOWN_WAIT");
+  const badGroup = captureIdentityRefusal(23001, `S 1 ${darwinBirth} private-command`).diagnostic;
+  assert.equal(badGroup.rowMatched, true); assert.equal(badGroup.groupFieldClass, "NOT_SAFE_PRIVATE_GROUP");
+  assert.equal(badGroup.stateMarkerClass, "NON_Z_PREFIX");
+  const multiple = captureIdentityRefusal(23001, `S 23001 ${darwinBirth} first\nsecond`).diagnostic;
+  assert.equal(multiple.trimmedLineClass, "MULTIPLE"); assert.equal(multiple.rowMatched, false);
+  assert.equal(multiple.commandPresent, null);
+});
+
+test("Darwin diagnostic never coerces nonstrings or over-budget input and never echoes unknown text", () => {
+  const privateText = "SECRET-cookie-token-user-path-date-command";
+  const hostile = { toString: () => assert.fail("do not coerce input"),
+    get length() { assert.fail("do not read object length"); } };
+  const nonstring = captureIdentityRefusal(23001, hostile, privateText).diagnostic;
+  assert.equal(nonstring.stage, "INPUT"); assert.equal(nonstring.outputKind, "OTHER");
+  assert.equal(nonstring.codeUnits, null); assert.equal(nonstring.trimmedLineClass, "UNOBSERVED");
+  assert.equal(nonstring.context, "UNSPECIFIED");
+  const long = captureIdentityRefusal(23001, "x".repeat(65_537)).diagnostic;
+  assert.equal(long.codeUnits, 65_537); assert.equal(long.stage, "INPUT");
+  assert.equal(long.leadingColumnsShape, null); assert.equal(long.trimmedLineClass, "UNOBSERVED");
+  for (const diagnostic of [nonstring, long, captureIdentityRefusal(23001, privateText).diagnostic]) {
+    assert.equal(JSON.stringify(diagnostic).includes(privateText), false);
+    assert.ok(Object.values(diagnostic).every(value => value === null || ["string", "number", "boolean"].includes(typeof value)));
+  }
+});
+
+test("Darwin diagnostic belongs only to its exact locally thrown error and remains frozen", () => {
+  const first = captureIdentityRefusal(23001, "", "SUPERVISOR_SIGNAL");
+  const before = JSON.stringify(first.diagnostic);
+  captureIdentityRefusal(23001, "changed later", "SUPERVISOR_SHUTDOWN_WAIT");
+  assert.equal(processIdentityFailureDiagnostic(first.error), first.diagnostic);
+  assert.equal(JSON.stringify(first.diagnostic), before); assert.equal(Object.isFrozen(first.diagnostic), true);
+  assert.throws(() => { first.diagnostic.context = "changed"; }, TypeError);
+  assert.equal(processIdentityFailureDiagnostic(new Error(first.error.message)), null);
+  assert.equal(processIdentityFailureDiagnostic({ diagnostic: first.diagnostic }), null);
+  assert.equal(processIdentityFailureDiagnostic(new Proxy({}, { get: () => assert.fail("no property access") })), null);
+  for (const value of [null, undefined, 0, "private-text"]) assert.equal(processIdentityFailureDiagnostic(value), null);
+});
+
+test("Darwin structural diagnostics do not authorize a signal or alter matching live identities", () => {
+  const failure = captureIdentityRefusal(23001, "");
+  let signals = 0;
+  assert.throws(() => signalOwnedProcess(original, "SIGTERM", {
+    inspect: () => { throw failure.error; }, kill: () => signals++,
+  }), error => error === failure.error);
+  assert.equal(signals, 0);
+  const live = parseDarwinProcessIdentity(23001, `Ss+ 23001 ${darwinBirth} ${darwinCommand}`, "SUPERVISOR_SIGNAL");
+  assert.deepEqual(live, { pid: 23001, pgid: 23001, startId: `${darwinBirth}:${commandDigest(darwinCommand)}` });
+  assert.equal(parseDarwinProcessIdentity(23001, `Z 23001 ${darwinBirth} <defunct>`, "SUPERVISOR_SHUTDOWN_WAIT"), null);
+});
 
 test("Darwin live parsing retains the original birth and command fingerprint", () => {
   const observed = parseDarwinProcessIdentity(23001, `  Ss+ 23001 ${darwinBirth} ${darwinCommand}\n`);

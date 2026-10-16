@@ -10,7 +10,7 @@ import { homedir } from "node:os";
 import { isDeepStrictEqual } from "node:util";
 import { initState, readState, removeState } from "./dev-stack-state.mjs";
 import { resolvePorts, readImages, readOpenCodeVersion, composeConfig, serviceEnv } from "./dev-stack-config.mjs";
-import { processIdentity, sameProcess, signalOwnedProcess, createShutdownSignals, waitGroupsGone, verifyShutdownGroups } from "./dev-stack-process.mjs";
+import { processIdentity, processIdentityFailureDiagnostic, sameProcess, signalOwnedProcess, createShutdownSignals, waitGroupsGone, verifyShutdownGroups } from "./dev-stack-process.mjs";
 import { openCodeWrapper } from "./dev-stack-wrapper.mjs";
 import { withLifecycleAdmission } from "./dev-stack-lifecycle.mjs";
 import { prepareDevPtyDependency } from "./dev-stack-native.mjs";
@@ -187,7 +187,7 @@ async function stopState(state, reset = false, { signal } = {}) {
     // Never signal the shared npm/shell process group or trust PID alone.
     signalOwnedProcess(runtime.supervisor);
     await waitUntil(() => {
-      const current = processIdentity(runtime.supervisor.pid);
+      const current = processIdentity(runtime.supervisor.pid, "SUPERVISOR_SHUTDOWN_WAIT");
       if (!current) return true;
       if (current.startId !== runtime.supervisor.startId) throw new Error("Supervisor PID was reused; refusing teardown escalation.");
       return false;
@@ -405,6 +405,8 @@ export async function main(args = process.argv.slice(2)) {
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch(error => {
     // Do not serialize causes that might include service environment or secret-bearing output.
+    const diagnostic = processIdentityFailureDiagnostic(error);
+    if (diagnostic) console.error(JSON.stringify(diagnostic));
     console.error(`dev-stack failed: ${error.message}`);
     process.exitCode = 1;
   });
