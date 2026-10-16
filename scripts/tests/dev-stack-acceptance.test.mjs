@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   acceptanceOwner, assertOwner, assertReadiness, assertSourceStorage, assertSession, assertStarterRoom,
-  createTerminalObservation, runAcceptance, selectStarterPane, sourceStartupTimeoutMs, terminalUrl,
+  createTerminalObservation, readinessFailureDiagnostic, runAcceptance, selectStarterPane, sourceStartupTimeoutMs, terminalUrl,
 } from "../dev-stack-acceptance.mjs";
 
 const project = `space-dev-${"a".repeat(24)}`;
@@ -72,6 +72,116 @@ test("readiness requires the actual postgres, workflow pollers and host shape", 
 test("HTTP 200 with ok=false never passes readiness", () => {
   const value = ready(); value.body.ok = false;
   assert.throws(() => assertReadiness(value), /NOT_READY/u);
+});
+
+function failedReadiness(response) {
+  let captured;
+  assert.throws(() => assertReadiness(response), error => {
+    assert.equal(error.code, "DEV_STACK_ACCEPTANCE_NOT_READY");
+    captured = error;
+    return true;
+  });
+  return captured;
+}
+
+test("readiness failure preserves all producer decision enums from that exact response", () => {
+  const value = ready();
+  value.status = 503; value.body.ok = false;
+  Object.assign(value.body.dependencies, {
+    worker: "NO_POLLERS", cliAdminHost: "disabled", browserHost: "CAPACITY_MISMATCH",
+  });
+  const error = failedReadiness(value);
+  assert.deepEqual(readinessFailureDiagnostic(error), {
+    schema: "spaceapp.dev-stack-readiness-failure.v1", httpStatus: 503, ok: false,
+    dependencies: { store: "postgres", runtimeStore: "postgres", database: "RUNNING",
+      worker: "NO_POLLERS", cliHost: "RUNNING", cliAdminHost: "disabled", browserHost: "CAPACITY_MISMATCH" },
+  });
+  assert.equal(error.message, "DEV_STACK_ACCEPTANCE_NOT_READY");
+  assert.equal(Object.hasOwn(error, "body"), false);
+  assert.equal(Object.hasOwn(error, "readiness"), false);
+});
+
+test("readiness snapshot cannot be replaced by later response mutation or another probe", () => {
+  const value = ready(); value.status = 503; value.body.dependencies.worker = "ERROR";
+  const error = failedReadiness(value);
+  const snapshot = readinessFailureDiagnostic(error);
+  value.status = 200; value.body.dependencies.worker = "RUNNING";
+  assert.equal(assertReadiness(value), true);
+  const later = ready(); later.status = 503; later.body.dependencies.worker = "NO_POLLERS";
+  const laterError = failedReadiness(later);
+  assert.equal(readinessFailureDiagnostic(error), snapshot);
+  assert.equal(snapshot.httpStatus, 503);
+  assert.equal(snapshot.dependencies.worker, "ERROR");
+  assert.equal(readinessFailureDiagnostic(laterError).dependencies.worker, "NO_POLLERS");
+  assert.ok(Object.isFrozen(snapshot) && Object.isFrozen(snapshot.dependencies));
+  assert.throws(() => { snapshot.dependencies.worker = "synthetic-private-marker"; }, TypeError);
+});
+
+test("readiness diagnostics never echo unknown strings, raw bodies, headers or identities", () => {
+  const secret = "synthetic-private-marker";
+  const value = { status: 503, headers: { Cookie: secret }, body: {
+    ok: false, apiStartedAt: secret, credentials: secret, dependencies: {
+      store: secret, runtimeStore: secret, database: secret, worker: secret,
+      cliHost: secret, cliAdminHost: secret, browserHost: secret,
+      appDiagnostics: { captureId: secret }, browserHostBuildCommit: secret,
+      browserHostCaptureMetrics: { secret }, pollerIdentities: [secret], statusReason: secret,
+    },
+  } };
+  const snapshot = readinessFailureDiagnostic(failedReadiness(value));
+  assert.ok(Object.values(snapshot.dependencies).every(x => x === "UNRECOGNIZED"));
+  const encoded = JSON.stringify(snapshot);
+  assert.equal(encoded.includes(secret), false);
+  assert.equal(encoded.includes("Cookie"), false);
+  assert.equal(encoded.includes("appDiagnostics"), false);
+  assert.ok(Buffer.byteLength(encoded) < 1024);
+});
+
+test("readiness projection handles malformed fixed fields without coercion or text echo", () => {
+  for (const status of [NaN, Infinity, -1, 99, 600, "503", { toString() { assert.fail("No coercion"); } }]) {
+    const snapshot = readinessFailureDiagnostic(failedReadiness({ status, body: null }));
+    assert.equal(snapshot.httpStatus, null);
+    assert.equal(snapshot.ok, null);
+    assert.ok(Object.values(snapshot.dependencies).every(x => x === "UNRECOGNIZED"));
+  }
+  for (const body of [undefined, null, [], "synthetic-private-marker", { ok: "false", dependencies: null }]) {
+    const snapshot = readinessFailureDiagnostic(failedReadiness({ status: 503, body }));
+    assert.equal(snapshot.httpStatus, 503); assert.equal(snapshot.ok, null);
+    assert.equal(JSON.stringify(snapshot).includes("synthetic-private"), false);
+  }
+});
+
+test("diagnostic boundary ignores inherited fields, accessors and hostile dependency descriptors", () => {
+  let reads = 0;
+  const dependencies = Object.create({ store: "postgres" });
+  Object.defineProperty(dependencies, "worker", { get() { reads++; throw Error("synthetic-private"); } });
+  const body = { dependencies };
+  Object.defineProperty(body, "ok", { get() { reads++; throw Error("synthetic-private"); } });
+  const snapshot = readinessFailureDiagnostic(failedReadiness({ status: 503, body }));
+  assert.equal(reads, 0); assert.equal(snapshot.ok, null);
+  assert.equal(snapshot.dependencies.store, "UNRECOGNIZED");
+  assert.equal(snapshot.dependencies.worker, "UNRECOGNIZED");
+  const hostile = new Proxy({}, { getOwnPropertyDescriptor() { throw Error("synthetic-private"); } });
+  const safe = readinessFailureDiagnostic(failedReadiness({ status: 503, body: { dependencies: hostile } }));
+  assert.equal(JSON.stringify(safe).includes("synthetic-private"), false);
+});
+
+test("foreign errors and forged readiness properties cannot cross the diagnostic boundary", () => {
+  let reads = 0;
+  const fake = new Error("synthetic-private");
+  Object.defineProperty(fake, "readiness", { get() { reads++; throw Error("synthetic-private"); } });
+  fake.code = "DEV_STACK_ACCEPTANCE_NOT_READY";
+  for (const error of [null, undefined, 1, "synthetic-private", fake, {}, () => {}, new Proxy({}, {
+    get() { reads++; throw Error("synthetic-private"); },
+  })]) assert.equal(readinessFailureDiagnostic(error), null);
+  assert.equal(reads, 0);
+});
+
+test("CI serializes only locally captured readiness without weakening or retrying the final assertion", () => {
+  const source = readFileSync(new URL("../dev-stack-ci.mjs", import.meta.url), "utf8");
+  assert.match(source, /readiness: readinessFailureDiagnostic\(primaryFailure\)/u);
+  const acceptance = readFileSync(new URL("../dev-stack-acceptance.mjs", import.meta.url), "utf8");
+  assert.equal((acceptance.match(/assertReadiness\(await request\("\/readyz\?strict=1"\)\)/gu) ?? []).length, 2);
+  assert.match(acceptance, /assertSession\(active, expected, \{ requireRunning: true \}\);\s*assertReadiness\(await request\("\/readyz\?strict=1"\)\)/u);
 });
 
 const storageRoot = join(process.cwd(), "synthetic-checkout");

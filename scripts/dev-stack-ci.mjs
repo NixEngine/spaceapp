@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
 import { readState } from "./dev-stack-state.mjs";
 import { processIdentity, signalOwnedGroup, assertGroupsGone, darwinStateCwdProcesses } from "./dev-stack-process.mjs";
-import { runAcceptance, assertReadiness, sourceStartupTimeoutMs } from "./dev-stack-acceptance.mjs";
+import { runAcceptance, assertReadiness, readinessFailureDiagnostic, sourceStartupTimeoutMs } from "./dev-stack-acceptance.mjs";
 import { runBrowserProof } from "./dev-stack-browser.mjs";
 import { runApiReloadProof, runPackageRebuildProof, createOwnedAppendLog, openOwnedAppendLog, readOwnedLog } from "./dev-stack-reload.mjs";
 import { supervisorExitRecord } from "./dev-stack-diagnostics.mjs";
@@ -180,9 +180,11 @@ if (primaryFailure || cleanupFailures.length) {
   const code = error => typeof error?.code === "string" && /^[A-Z0-9_]{1,100}$/u.test(error.code)
     ? error.code : "CI_ERROR";
   // Preserve the original phase/failure separately from every cleanup failure.
-  // Fixed codes only: never print an HTTP body, cookie, ticket or environment.
+  // Fixed codes and a locally captured enum-only readiness projection: never
+  // print an HTTP body, cookie, ticket, metrics, identity or environment.
   console.error(JSON.stringify({ schema: "spaceapp.dev-stack-ci-failure.v1", passed: false,
     phase, primaryCode: primaryFailure ? code(primaryFailure) : null,
+    readiness: readinessFailureDiagnostic(primaryFailure),
     cleanupCodes: cleanupFailures.map(code), cleanupVerified: cleanupFailures.length === 0 }));
   throw new AggregateError([...(primaryFailure ? [primaryFailure] : []), ...cleanupFailures],
     "Source proof or cleanup failed; original and cleanup errors retained separately.");

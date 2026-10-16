@@ -12,6 +12,46 @@ import { stripVTControlCharacters } from "node:util";
 const RUNTIME = "cli:opencode";
 const MAX_HTTP_BYTES = 512 * 1024;
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+const readinessFailures = new WeakMap();
+const readinessEnums = Object.freeze({
+  store: ["postgres", "memory"],
+  runtimeStore: ["postgres", "memory"],
+  database: ["RUNNING", "UNAVAILABLE", "in-memory"],
+  worker: ["RUNNING", "NO_POLLERS", "ERROR", "disabled"],
+  cliHost: ["RUNNING", "UNAVAILABLE", "disabled"],
+  cliAdminHost: ["RUNNING", "UNAVAILABLE", "disabled"],
+  browserHost: ["in-process", "RUNNING", "UNAVAILABLE", "DISABLED", "CAPACITY_MISMATCH"],
+});
+
+function readinessData(object, key) {
+  if (object === null || typeof object !== "object") return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(object, key);
+    return descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined;
+  } catch { return undefined; }
+}
+
+function readinessSnapshot(status, body) {
+  const dependencies = readinessData(body, "dependencies");
+  const ok = readinessData(body, "ok");
+  return Object.freeze({
+    schema: "spaceapp.dev-stack-readiness-failure.v1",
+    httpStatus: Number.isSafeInteger(status) && status >= 100 && status <= 599 ? status : null,
+    ok: typeof ok === "boolean" ? ok : null,
+    dependencies: Object.freeze(Object.fromEntries(Object.entries(readinessEnums).map(([key, allowed]) => {
+      const value = readinessData(dependencies, key);
+      return [key, typeof value === "string" && allowed.includes(value) ? value : "UNRECOGNIZED"];
+    }))),
+  });
+}
+
+/** Only a locally captured failed response may supply this fixed diagnostic.
+ * Never inspect arbitrary error properties, causes, body text or later probes.
+ */
+export function readinessFailureDiagnostic(error) {
+  return error !== null && (typeof error === "object" || typeof error === "function")
+    ? (readinessFailures.get(error) ?? null) : null;
+}
 
 function requireCondition(condition, code) {
   if (!condition) {
@@ -36,10 +76,17 @@ export function sourceStartupTimeoutMs(platform, initial = false) {
 /** HTTP 200 alone is deliberately insufficient, including with ?strict=1. */
 export function assertReadiness({ status, body }) {
   const dependencies = body?.dependencies;
-  requireCondition(status === 200 && body?.ok === true
+  if (!(status === 200 && body?.ok === true
     && dependencies?.store === "postgres" && dependencies.runtimeStore === "postgres"
     && dependencies.database === "RUNNING" && dependencies.worker === "RUNNING"
-    && dependencies.cliHost === "RUNNING", "NOT_READY");
+    && dependencies.cliHost === "RUNNING")) {
+    const error = new Error("DEV_STACK_ACCEPTANCE_NOT_READY");
+    error.code = "DEV_STACK_ACCEPTANCE_NOT_READY";
+    // Keep only this response's closed projection, not its credentials, raw
+    // body, headers, paths, timestamps, metrics or worker/poller identities.
+    readinessFailures.set(error, readinessSnapshot(status, body));
+    throw error;
+  }
   // The temporal label tracks enableDummyTurns, not actual worker pollers.
   // worker=RUNNING is the source's workflow+activity poller check; this does
   // not assert that a workflow or provider task has been executed.
