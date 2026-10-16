@@ -1,8 +1,57 @@
 import { readFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { isAbsolute, sep } from "node:path";
 
 const digest = value => createHash("sha256").update(value).digest("hex");
+
+/** Parse lsof's explicit p/f/n fields; NUL protects spaces and newlines. */
+export function parseCwdRecords(output, stateDir) {
+  if (typeof output !== "string" || !isAbsolute(stateDir) || output.length > 8 * 1024 * 1024) {
+    throw new Error("Invalid cwd observation.");
+  }
+  let pid;
+  let cwdDescriptor = false;
+  const found = new Set();
+  for (const raw of output.split("\0")) {
+    const field = raw.replace(/^\n/u, ""); // lsof's process/file-set separator.
+    if (!field || field === "\n") continue;
+    if (field.startsWith("p")) {
+      if (!/^p[1-9][0-9]*$/u.test(field)) throw new Error("Invalid cwd process field.");
+      pid = Number(field.slice(1));
+      if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error("Invalid cwd PID.");
+      cwdDescriptor = false;
+    } else if (field === "fcwd") {
+      if (!pid) throw new Error("Unbound cwd descriptor.");
+      cwdDescriptor = true;
+    } else if (field.startsWith("n")) {
+      if (!pid || !cwdDescriptor) throw new Error("Unbound cwd file field.");
+      const cwd = field.slice(1);
+      if (cwd === stateDir || cwd.startsWith(`${stateDir}${sep}`)) found.add(pid);
+    } else throw new Error("Unexpected cwd observation field.");
+  }
+  return [...found];
+}
+
+/** Darwin has no /proc: inspect own-user cwd descriptors without a tree scan. */
+export function darwinStateCwdProcesses(stateDir, { execute = spawnSync, uid = process.getuid?.() } = {}) {
+  if (!Number.isSafeInteger(uid) || uid < 0 || !isAbsolute(stateDir)) throw new Error("Invalid cwd scan identity.");
+  let observed;
+  try {
+    // Explicit f handles old lsof releases that always emitted it and new ones
+    // that omit it unless selected. Reject even successful partial-error output.
+    observed = execute("lsof", ["-nP", "-a", "-u", String(uid), "-d", "cwd", "-F0pfn"], {
+      encoding: "utf8", timeout: 15_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"]
+    });
+  } catch {
+    throw new Error("Darwin cwd observation failed; cleanup is not certified.");
+  }
+  if (observed?.error || observed?.stderr?.length || ![0, 1].includes(observed?.status)
+    || typeof observed?.stdout !== "string" || (observed.status === 1 && observed.stdout.length)) {
+    throw new Error("Darwin cwd observation failed; cleanup is not certified.");
+  }
+  return parseCwdRecords(observed.stdout, stateDir);
+}
 
 /** Local process ownership, not authorization against a hostile same-user writer. */
 export function processIdentity(pid) {

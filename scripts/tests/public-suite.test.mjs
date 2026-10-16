@@ -25,3 +25,5 @@ import "./dev-stack-wrapper.test.mjs";
 import "./dev-stack-acceptance.test.mjs";
 import "./dev-stack-runner.test.mjs";
 import "./dev-stack-lifecycle.test.mjs";
+import "./dev-stack-browser.test.mjs";
+import "./dev-stack-reload.test.mjs";

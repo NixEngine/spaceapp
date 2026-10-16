@@ -1,8 +1,39 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { sameProcess, signalOwnedGroup, signalOwnedProcess, processIdentity, assertGroupsGone } from "../dev-stack-process.mjs";
+import { parseCwdRecords, darwinStateCwdProcesses } from "../dev-stack-process.mjs";
+import { resolve, join } from "node:path";
 
 const original = { pid: 23001, pgid: 23001, startId: "boot:12345" };
+
+test("NUL cwd records bind each path to its PID and exclude sibling prefixes", () => {
+  const state = resolve("isolated state");
+  const output = `p23001\0\nfcwd\0n${state}\0\np23002\0\nfcwd\0n${join(state, "child with spaces")}\0\np23003\0\nfcwd\0n${state}-foreign\0\n`;
+  assert.deepEqual(parseCwdRecords(output, state), [23001, 23002]);
+  assert.deepEqual(parseCwdRecords("", state), []);
+  assert.throws(() => parseCwdRecords(`n${state}\0`, state), /Unbound/u);
+  assert.throws(() => parseCwdRecords(`pnot-a-pid\0`, state), /Invalid/u);
+  assert.throws(() => parseCwdRecords(`p23001\0cunexpected\0`, state), /Unexpected/u);
+});
+
+test("Darwin cwd scanner requests only the selected user's cwd, not recursive paths", () => {
+  const state = resolve("isolated-state");
+  assert.deepEqual(darwinStateCwdProcesses(state, { uid: 501, execute: (command, args) => {
+    assert.equal(command, "lsof");
+    assert.deepEqual(args, ["-nP", "-a", "-u", "501", "-d", "cwd", "-F0pfn"]);
+    return { status: 0, stdout: `p23001\0\nfcwd\0n${state}\0\n`, stderr: "" };
+  } }), [23001]);
+});
+
+test("Darwin cwd no-match is distinct from failed or denied observation", () => {
+  const state = resolve("isolated-state");
+  assert.deepEqual(darwinStateCwdProcesses(state, { uid: 501, execute: () => ({ status: 1, stdout: "", stderr: "" }) }), []);
+  for (const observation of [{ error: { code: "ENOENT" } }, { status: 1, stderr: "permission denied", stdout: "" },
+    { status: 2, stdout: "", stderr: "" }, { status: 0, stdout: "", stderr: "partial permission failure" }]) {
+    assert.throws(() => darwinStateCwdProcesses(state, { uid: 501, execute: () => observation }), /not certified/u);
+  }
+  assert.throws(() => darwinStateCwdProcesses(state, { uid: -1, execute: () => assert.fail() }), /identity/u);
+});
 
 test("ownership requires creation identity and a dedicated process group", () => {
   assert.equal(sameProcess(original, { ...original }), true);

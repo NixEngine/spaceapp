@@ -47,6 +47,77 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: contributor-source-stack-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/spaceapp-dev-stack-*.txt
+            ${{ runner.temp }}/spaceapp-dev-stack-browser-*/*.png
+            ${{ runner.temp }}/spaceapp-dev-stack-browser-*/*.json
+          # PNGs and bounded aggregate receipts contain only the synthetic owner UI.
+          # No cookie, password, setup token, raw network header or terminal input.
+          retention-days: 1
+          if-no-files-found: ignore
+
+  public-source-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Install exact locked source dependencies
+        run: npm ci
+      - name: Repository public source and workspace suites
+        run: npm test
+
+  macos-source-stack:
+    # Standard public runner, not a larger/paid runner. Intel permits Colima's VM.
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Install exact locked source dependencies
+        run: npm ci
+      - name: Prepare Docker only in this isolated macOS runner
+        run: |
+          test ! -e "$HOME/.colima/default"
+          brew install colima docker docker-compose
+          mkdir -p "$HOME/.docker/cli-plugins"
+          compose_plugin="$(brew --prefix)/lib/docker/cli-plugins/docker-compose"
+          test -x "$compose_plugin"
+          if test ! -e "$HOME/.docker/cli-plugins/docker-compose" && test ! -L "$HOME/.docker/cli-plugins/docker-compose"; then
+            ln -s "$compose_plugin" "$HOME/.docker/cli-plugins/docker-compose"
+          fi
+          echo "SPACEAPP_COLIMA_OWNED=1" >> "$GITHUB_ENV"
+          colima start --runtime docker --cpu 2 --memory 6 --disk 20
+          test "$(docker context show)" = "colima"
+          docker info
+          docker compose version
+      - name: Native source stack unit controls
+        run: npm run test:dev-stack
+      - name: Real macOS owner, CLI transport, watch, rebuild and owned reset
+        run: node scripts/dev-stack-ci.mjs
+      - name: Preserve synthetic native macOS diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: contributor-source-stack-macos-${{ github.run_id }}
           path: ${{ runner.temp }}/spaceapp-dev-stack-*.txt
           retention-days: 1
           if-no-files-found: ignore
+      - name: Remove only this job's Colima profile and data
+        if: always() && env.SPACEAPP_COLIMA_OWNED == '1'
+        run: colima delete --data -f

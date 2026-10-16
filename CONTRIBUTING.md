@@ -91,6 +91,27 @@ The full issue65 acceptance additionally requires actual Linux and macOS/WSL2
 output, visible UI/hot-reload/failure/cleanup evidence and the normal repository
 checks; do not call the feature accepted from helper tests or a prepared CI file.
 
+The opt-in `scripts/dev-stack-ci.mjs` proof is restricted to an isolated Linux
+or macOS CI checkout with fresh state. On Linux it additionally uses an already
+installed Chrome/Chromium binary, a new private profile and the ordinary web
+login to observe the real pane/xterm, save synthetic PNGs and edit/restore the
+original instance-badge component while checking same-document React HMR.
+This is a test browser, not the optional application browser service. No browser
+is installed by the script; a missing binary is an explicit failing prerequisite.
+macOS records that browser part as not performed rather than reporting a pass.
+
+Both native jobs temporarily edit/restore the original API liveness module to
+observe `tsx watch`, then edit/restore `packages/runtime/src/index.ts` and invoke
+the documented `rebuild` command. A new worker must load the rebuilt package;
+project, ports, generated secrets, owner, starter room and pane must persist.
+Source bytes are restored in `finally`; the temporary compiled package probe
+remains only in the disposable CI checkout until disposal. The proof then
+checks explicit worker failure and owned reset. Screenshots require visual
+review; geometry or CI green alone does not certify the full OpenCode UI.
+Combine actual Linux and macOS results for the same commit before claiming
+cross-platform acceptance. These scripts do not submit provider input or a
+model task and must not be used against an operator checkout.
+
 ### First executed task, without a provider
 
 ```sh

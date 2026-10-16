@@ -5,37 +5,45 @@ import { join, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
 import { readState } from "./dev-stack-state.mjs";
-import { processIdentity, signalOwnedGroup, assertGroupsGone } from "./dev-stack-process.mjs";
-import { runAcceptance } from "./dev-stack-acceptance.mjs";
+import { processIdentity, signalOwnedGroup, assertGroupsGone, darwinStateCwdProcesses } from "./dev-stack-process.mjs";
+import { runAcceptance, assertReadiness } from "./dev-stack-acceptance.mjs";
+import { runBrowserProof } from "./dev-stack-browser.mjs";
+import { runApiReloadProof, runPackageRebuildProof } from "./dev-stack-reload.mjs";
 
-// Explicit isolated Linux CI only. This is not an operator-host diagnostic.
-if (process.platform !== "linux" || process.env.CI !== "true") {
-  throw new Error("Run this full-stack mutation proof only in an isolated Linux CI checkout.");
+// Explicit isolated POSIX CI only. This is not an operator-host diagnostic.
+if (!["linux", "darwin"].includes(process.platform) || process.env.CI !== "true") {
+  throw new Error("Run this full-stack mutation proof only in an isolated Linux/macOS CI checkout.");
 }
 const root = resolve(import.meta.dirname, "..");
 if (existsSync(join(root, ".dev-stack"))) throw new Error("CI proof requires fresh absent dev-stack state.");
 const logPath = join(process.env.RUNNER_TEMP || tmpdir(), `spaceapp-dev-stack-${process.pid}.txt`);
-const descriptor = openSync(logPath, "wx", 0o600);
-const supervisor = spawn(process.execPath, ["scripts/dev-stack.mjs"], {
-  cwd: root, env: process.env, detached: true, stdio: ["ignore", descriptor, descriptor]
-});
-closeSync(descriptor);
-let exit;
-let startError;
-supervisor.once("error", () => { startError = new Error("CI source supervisor could not start."); });
-supervisor.once("exit", (code, signal) => { exit = { code, signal }; });
+function spawnSupervisor(action = "up") {
+  const descriptor = openSync(logPath, action === "up" ? "wx" : "ax", 0o600);
+  let child;
+  try {
+    child = spawn(process.execPath, ["scripts/dev-stack.mjs", action], {
+      cwd: root, env: process.env, detached: true, stdio: ["ignore", descriptor, descriptor]
+    });
+  } finally { closeSync(descriptor); }
+  const observed = { child, exit: undefined, startError: undefined };
+  child.once("error", () => { observed.startError = new Error("CI source supervisor could not start."); });
+  child.once("exit", (code, signal) => { observed.exit = { code, signal }; });
+  return observed;
+}
+let supervisor = spawnSupervisor();
 const pause = () => new Promise(done => setTimeout(done, 500));
 async function until(predicate, timeoutMs, label, requireAlive = true) {
   const deadline = performance.now() + timeoutMs;
   while (performance.now() < deadline) {
-    if (startError) throw startError;
-    if (requireAlive && exit) throw new Error(`Supervisor exited before ${label}; inspect the captured source log.`);
+    if (supervisor.startError) throw supervisor.startError;
+    if (requireAlive && supervisor.exit) throw new Error(`Supervisor exited before ${label}; inspect the captured source log.`);
     if (await predicate()) return;
     await pause();
   }
   throw new Error(`CI timed out at ${label}.`);
 }
 function leftovers(state) {
+  if (process.platform === "darwin") return darwinStateCwdProcesses(state.stateDir);
   const found = [];
   for (const name of readdirSync("/proc")) {
     if (!/^\d+$/.test(name)) continue;
@@ -56,24 +64,59 @@ function reset() {
 let state;
 let receipts = [];
 let proof;
-try {
+let browser;
+let apiReload;
+let packageRebuild;
+let afterRebuild;
+async function waitReady(label, requireCurrentSupervisor = false) {
   await until(async () => {
     if (!existsSync(join(root, ".dev-stack", "owner.json"))) return false;
     try {
       state = readState(root);
+      if (requireCurrentSupervisor) {
+        const record = JSON.parse(readFileSync(join(state.stateDir, "runtime.json"), "utf8"));
+        const observed = processIdentity(supervisor.child.pid);
+        if (!observed || record.supervisor.pid !== observed.pid || record.supervisor.startId !== observed.startId) return false;
+      }
       const response = await fetch(`http://127.0.0.1:${state.ports.api}/readyz?strict=1`, { signal: AbortSignal.timeout(3000) });
-      const body = await response.json();
-      return response.status === 200 && body.ok === true && body.dependencies?.worker === "RUNNING";
+      return assertReadiness({ status: response.status, body: await response.json() });
     } catch { return false; }
-  }, 15 * 60_000, "strict source startup");
+  }, 15 * 60_000, label);
+}
+try {
+  await waitReady("strict source startup", true);
   proof = await runAcceptance({ state });
+  browser = process.platform === "linux"
+    ? await runBrowserProof({ state,
+      artifactDir: join(process.env.RUNNER_TEMP || tmpdir(), `spaceapp-dev-stack-browser-${process.pid}`) })
+    : { performed: false, passed: false, reason: "Browser UI proof runs in the Linux job; this job verifies the native macOS source stack." };
+  apiReload = await runApiReloadProof({ state });
+  packageRebuild = await runPackageRebuildProof({ state, readLog: () => readFileSync(logPath, "utf8"),
+    restart: async () => {
+      const old = supervisor;
+      const oldState = state;
+      const oldRuntime = JSON.parse(readFileSync(join(state.stateDir, "runtime.json"), "utf8"));
+      supervisor = spawnSupervisor("rebuild");
+      await until(() => old.exit !== undefined, 120_000, "old supervisor exits for documented rebuild");
+      if (old.exit.code !== 0) throw new Error("Rebuild did not stop the original supervisor cleanly.");
+      assertGroupsGone(oldRuntime.children);
+      await waitReady("new rebuilt source supervisor", true);
+      const preserved = state.project === oldState.project && JSON.stringify(state.ports) === JSON.stringify(oldState.ports)
+        && Object.keys(oldState.secrets).every(key => state.secrets[key] === oldState.secrets[key]);
+      if (!preserved) throw new Error("Rebuild did not preserve the project, ports and generated secrets.");
+      return { oldSupervisorExited: true, newSupervisorVerified: true, projectAndSecretsPreserved: true };
+    } });
+  afterRebuild = await runAcceptance({ state });
+  if (afterRebuild.ownerClaimedNow || afterRebuild.starterRoomId !== proof.starterRoomId || afterRebuild.paneId !== proof.paneId) {
+    throw new Error("Rebuild did not retain the original owner, starter room and pane.");
+  }
   const runtime = JSON.parse(readFileSync(join(state.stateDir, "runtime.json"), "utf8"));
   receipts = runtime.children;
   const worker = receipts.find(record => record.name === "worker");
   if (!worker || !processIdentity(worker.pid)) throw new Error("No running owned worker to test the failure path.");
   signalOwnedGroup(worker);
-  await until(() => exit !== undefined, 60_000, "visible worker failure shutdown", false);
-  if (exit.code === 0 || !/worker exited unexpectedly/.test(readFileSync(logPath, "utf8"))) {
+  await until(() => supervisor.exit !== undefined, 60_000, "visible worker failure shutdown", false);
+  if (supervisor.exit.code === 0 || !/worker exited unexpectedly/.test(readFileSync(logPath, "utf8"))) {
     throw new Error("Worker failure did not produce an explicit failing supervisor outcome.");
   }
   assertGroupsGone(receipts);
@@ -86,18 +129,21 @@ try {
     if (remaining) throw new Error(`Reset left owned ${kind} resources.`);
   }
   console.log(JSON.stringify({
-    schema: "spaceapp.dev-stack-ci.v1", passed: true, platform: process.platform,
-    node: process.version, acceptance: proof, explicitWorkerFailureVerified: true,
+    schema: "spaceapp.dev-stack-ci.v2", passed: true, platform: process.platform,
+    node: process.version, acceptance: proof, browser, apiReload, packageRebuild,
+    postRebuildAcceptance: afterRebuild, explicitWorkerFailureVerified: true,
     ownedProcessGroupsGone: true, stateCwdProcessesGone: true, resetStateGone: true,
     ownedContainersVolumesNetworksGone: true,
-    browserUiVerified: false, hotReloadVerified: false, secondPlatformVerified: false,
+    browserUiVerified: browser.passed === true, webHotReloadVerified: browser.webReactHmrVerified === true,
+    apiWatchReloadVerified: apiReload.passed === true, packageRebuildVerified: packageRebuild.passed === true,
+    secondPlatformVerified: false,
     completeIssueAcceptance: false
   }, null, 2));
 } finally {
-  if (!exit && supervisor.pid) {
+  if (!supervisor.exit && supervisor.child.pid) {
     // Only the actual child handle just created by this proof; never a historic PID.
-    supervisor.kill("SIGTERM");
-    await until(() => exit !== undefined, 45_000, "proof supervisor cleanup", false).catch(() => {});
+    supervisor.child.kill("SIGTERM");
+    await until(() => supervisor.exit !== undefined, 45_000, "proof supervisor cleanup", false).catch(() => {});
   }
   // A failed cleanup remains a failed job. Do not suppress reset/resource errors
   // or declare a clean environment merely because the leader is gone.
