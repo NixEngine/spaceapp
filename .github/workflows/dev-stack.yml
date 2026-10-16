@@ -10,7 +10,7 @@ on:
       - "package-lock.json"
       - ".github/workflows/dev-stack.yml"
   push:
-    branches: ["feat/issue-65-dev-stack-nexo"]
+    branches: ["feat/issue-65-dev-stack-nexo", "diagnostics/issue-65-native-pty-nexo"]
   workflow_dispatch:
 
 permissions:
@@ -22,6 +22,7 @@ concurrency:
 
 jobs:
   linux-source-stack:
+    if: github.event_name != 'push' || github.ref != 'refs/heads/diagnostics/issue-65-native-pty-nexo'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -57,6 +58,7 @@ jobs:
           if-no-files-found: ignore
 
   public-source-tests:
+    if: github.event_name != 'push' || github.ref != 'refs/heads/diagnostics/issue-65-native-pty-nexo'
     runs-on: ubuntu-latest
     timeout-minutes: 35
     env:
@@ -71,10 +73,19 @@ jobs:
           cache: npm
       - name: Install exact locked source dependencies
         run: npm ci
+      # Same prerequisite as the repository's original CI/release/security jobs.
+      # This installs only in the disposable public Ubuntu runner, not the host.
+      - name: Install ripgrep (the file search tests run the real rg)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+          command -v rg
+          rg --version
+          node -e "require('node:child_process').execFileSync('rg', ['--version'], { cwd: process.cwd(), stdio: 'inherit' })"
       - name: Repository public source and workspace suites
         run: npm test
 
   macos-source-stack:
+    if: github.event_name != 'push' || github.ref != 'refs/heads/diagnostics/issue-65-native-pty-nexo'
     # Standard public runner, not a larger/paid runner. Intel permits Colima's VM.
     runs-on: macos-15-intel
     timeout-minutes: 45
@@ -121,3 +132,54 @@ jobs:
       - name: Remove only this job's Colima profile and data
         if: always() && env.SPACEAPP_COLIMA_OWNED == '1'
         run: colima delete --data -f
+
+  native-pty-diagnostic:
+    # A bounded layer control, never a replacement for full source acceptance.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/diagnostics/issue-65-native-pty-nexo'
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Install exact locked source dependencies
+        run: npm ci
+      - name: Observe actual native binding and adjacent helper without repair
+        run: |
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const info = require('node-pty/package.json');
+          const root = path.dirname(require.resolve('node-pty/package.json'));
+          require('node-pty');
+          const bindings = Object.keys(require.cache).filter(file =>
+            file.startsWith(root + path.sep) && file.endsWith('.node'));
+          if (bindings.length !== 1) throw new Error('Native binding observation is not unique.');
+          const records = bindings.map(binding => {
+            const helper = path.join(path.dirname(binding), 'spawn-helper');
+            let helperObservation;
+            try {
+              const stat = fs.lstatSync(helper);
+              let executable = false;
+              try { fs.accessSync(helper, fs.constants.X_OK); executable = true; } catch {}
+              helperObservation = { present: true, file: stat.isFile(), symbolicLink: stat.isSymbolicLink(),
+                mode: (stat.mode & 0o777).toString(8), uid: stat.uid, executable };
+            } catch (error) {
+              if (error.code !== 'ENOENT') throw new Error('Native helper metadata observation failed.');
+              helperObservation = { present: false, executable: false };
+            }
+            return { binding: path.relative(root, binding), helper: helperObservation };
+          });
+          console.log(JSON.stringify({ mode: 'READ_ONLY_NATIVE_METADATA', platform: process.platform,
+            arch: process.arch, node: process.version, nodePty: info.version, records }));
+          NODE
+      - name: Build only the original CLI host workspace
+        run: npm run build -w @space/cli-host
+      - name: Original synthetic-runtime real PTY IPC positive and negative controls
+        run: npm run test:contributor

@@ -137,6 +137,24 @@ container. It does not certify the Windows/macOS installer.
 
 ## Make and verify a small change
 
+### Isolated native transport diagnosis
+
+The temporary contributor branch `diagnostics/issue-65-native-pty-nexo` routes
+pushes to one bounded standard macOS job in `dev-stack.yml`. It installs the
+locked dependencies, reports only the loaded native binding's relative path
+and adjacent `spawn-helper` metadata without repairing either, builds the
+original CLI host, and runs the original `test:contributor` positive and
+negative controls. No Docker, API, browser, OpenCode install or provider is
+started by this job. An executable helper or successful native import alone
+does not prove that a PTY can start.
+
+Its result concerns a **simulated runtime over real PTY/Unix IPC** only, not
+the source-stack terminal failure's historical cause or full issue acceptance.
+Ordinary feature pushes, pull requests and manual workflow runs retain the
+full source jobs. Do not substitute this diagnostic job for their evidence.
+
+### Small changes
+
 Work on a branch, not on `main`, so the change can become a pull request:
 
 ```sh

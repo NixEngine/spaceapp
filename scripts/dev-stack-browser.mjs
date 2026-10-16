@@ -49,11 +49,42 @@ export function browserArtifactRootAllowed(path, stateDir, runnerTemp, ci) {
 /** The original UI connection label is 'attached', not the API's 'RUNNING'. */
 export function assertUiObservation(value) {
   demand(value?.paneCount === 1 && value.badgeVisible === true && value.roomObserved === true
+    && value.sampledTerminalPointsUnoccluded === true
     && value.status === "attached" && value.loading === "false" && value.hasError === "false"
     && value.hasSession === "true" && value.hasWebsocket === "true"
     && value.width >= 200 && value.height >= 100 && value.screenWidth >= 100 && value.screenHeight >= 50
     && (value.canvasCount > 0 || value.rowCount > 0), "UI_TERMINAL");
   return true;
+}
+
+/** Observe the original app's async onboarding discovery; never retain bodies/headers. */
+export function createSetupOverviewObservation(state) {
+  const requests = new Map();
+  let first;
+  return {
+    observe(method, params) {
+      const id = params?.requestId;
+      if (method === "Network.requestWillBeSent" && params.request?.method === "GET"
+        && browserUrlAllowed(params.request.url, state)
+        && new URL(params.request.url).pathname === "/api/setup/overview") {
+        demand(typeof id === "string" && id.length > 0 && id.length <= 256
+          && requests.size < 16 && !requests.has(id), "SETUP_DISCOVERY_BOUND");
+        requests.set(id, { status: null, finished: false, failed: false });
+        first ??= id;
+      }
+      const record = requests.get(id);
+      if (!record) return;
+      if (method === "Network.responseReceived") record.status = params.response?.status;
+      if (method === "Network.loadingFinished") record.finished = true;
+      if (method === "Network.loadingFailed") record.failed = true;
+    },
+    completedRequest() {
+      const record = requests.get(first);
+      if (!record) return null;
+      demand(!record.failed && (record.status === null || record.status === 200), "SETUP_DISCOVERY_FAILED");
+      return record.finished && record.status === 200 ? first : null;
+    },
+  };
 }
 
 /** Byte-preserving temporary mutation of one known original component literal. */
@@ -454,6 +485,7 @@ export async function runBrowserProof({ state, artifactDir, timeoutMs = 180000 }
   const network = { allowedRequests: 0, blockedRequests: 0, webSocketCreated: 0,
     terminalWebSocketUpgrades: 0, javascriptExceptions: 0 };
   const terminalRequests = new Set();
+  const setupOverview = createSetupOverviewObservation(state);
   async function until(predicate, label) {
     for (;;) {
       remaining();
@@ -496,8 +528,12 @@ export async function runBrowserProof({ state, artifactDir, timeoutMs = 180000 }
     return evaluate(`(() => { const panes=document.querySelectorAll(${JSON.stringify(PANE)}); const p=panes[0];
       const x=p?.querySelector('.terminal-xterm'); const screen=x?.querySelector('.xterm-screen');
       const r=x?.getBoundingClientRect(); const s=screen?.getBoundingClientRect();
+      const points=s&&[[.5,.5],[.25,.25],[.75,.25],[.25,.75],[.75,.75]];
+      const unoccluded=!!x&&!!s&&points.every(([dx,dy])=>{
+        const hit=document.elementFromPoint(s.x+s.width*dx,s.y+s.height*dy); return !!hit&&x.contains(hit); });
       const badge=document.querySelector(${JSON.stringify(BADGE)}); const br=badge?.getBoundingClientRect();
       return {paneCount:panes.length,badgeVisible:!!br&&br.width>0&&br.height>0,
+        sampledTerminalPointsUnoccluded:unoccluded,
         badge:badge?.textContent||'',roomObserved:document.body.innerText.includes('Getting Started'),
         status:p?.getAttribute('data-terminal-status'),loading:p?.getAttribute('data-terminal-loading'),
         hasError:p?.getAttribute('data-terminal-has-error'),hasSession:p?.getAttribute('data-terminal-has-session'),
@@ -569,6 +605,7 @@ export async function runBrowserProof({ state, artifactDir, timeoutMs = 180000 }
     client.listeners.add(async message => {
       if (message.sessionId !== sessionId) return;
       const params = message.params ?? {};
+      setupOverview.observe(message.method, params);
       if (message.method === "Fetch.requestPaused") {
         const allowed = browserUrlAllowed(params.request?.url, state);
         allowed ? network.allowedRequests++ : network.blockedRequests++;
@@ -603,10 +640,52 @@ export async function runBrowserProof({ state, artifactDir, timeoutMs = 180000 }
     demand(submit.count === 1 && submit.visible, "LOGIN_SUBMIT");
     await client.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" }, sessionId);
     await client.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 }, sessionId);
+    stage = "UI_SETUP_DISCOVERY";
+    let overviewRequest;
+    await until(() => { overviewRequest = setupOverview.completedRequest(); return !!overviewRequest; }, "UI_SETUP_DISCOVERY");
+    const overviewResponse = await client.send("Network.getResponseBody", { requestId: overviewRequest }, sessionId);
+    demand(overviewResponse.base64Encoded === false && typeof overviewResponse.body === "string"
+      && Buffer.byteLength(overviewResponse.body) <= 256 * 1024, "SETUP_DISCOVERY_BODY");
+    let setupWasIncomplete;
+    try {
+      const overview = JSON.parse(overviewResponse.body);
+      demand(typeof overview?.isComplete === "boolean", "SETUP_DISCOVERY_BODY");
+      setupWasIncomplete = !overview.isComplete;
+    } catch { throw fault("SETUP_DISCOVERY_BODY"); }
+    // Let the original fetch/JSON continuation and React commit apply. If it
+    // reports incomplete onboarding, acceptance additionally requires seeing
+    // its original backdrop at least once, then dismissing it through the UI.
+    await evaluate("new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))");
     stage = "UI_TERMINAL";
     let before;
     let roomClicked = false;
+    let setupDialogDismissedLocally = false;
+    let setupBackdropObserved = false;
     await until(async () => {
+      const backdrop = await selector(".setup-connections-backdrop", "setup-backdrop");
+      if (backdrop.visible) {
+        setupBackdropObserved = true;
+        // The original first-run dialog may lazy-load after login. Close only
+        // through its visible original button; never finish onboarding, call
+        // its persistence API, remove DOM or hide an obstructing overlay.
+        if (!setupDialogDismissedLocally) {
+          const closeSelector = '.setup-connections-dialog button[aria-label="Close Setup & connections"]';
+          const close = await selector(closeSelector, "setup-close-before-click");
+          if (close.visible) {
+            demand(close.count === 1, "SETUP_DIALOG_CLOSE");
+            const hit = await evaluate(`(() => { const b=document.querySelector(${JSON.stringify(closeSelector)});
+              const r=b?.getBoundingClientRect(); const p=r&&document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);
+              return !!b&&!!p&&b.contains(p); })()`);
+            if (hit) {
+              setupDialogDismissedLocally = true;
+              await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: close.x, y: close.y, button: "left", clickCount: 1 }, sessionId);
+              await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: close.x, y: close.y, button: "left", clickCount: 1 }, sessionId);
+            }
+          }
+        }
+        return false; // The backdrop must actually disappear before acceptance.
+      }
+      if (setupWasIncomplete && (!setupBackdropObserved || !setupDialogDismissedLocally)) return false;
       before = await observeUi();
       try { assertUiObservation(before); return network.terminalWebSocketUpgrades > 0; }
       catch {
@@ -653,6 +732,8 @@ export async function runBrowserProof({ state, artifactDir, timeoutMs = 180000 }
     result = {
       schema: "spaceapp.dev-stack-browser.v1", passed: true, project: state.project,
       browserUiVerified: true, browserLoginVerified: true, browserOwnerSetupVerified: false,
+      setupDialogDismissedLocally, setupOverviewOriginalRequestCompleted: true,
+      setupOverviewWasIncomplete: setupWasIncomplete, terminalVisibilitySamplePoints: 5,
       terminalAttached: true, terminalRendered: true, terminalWebSocketUpgradeVerified: true,
       openCodeBrandingObserved: restored.brandingObserved, fullOpenCodeTuiReviewed: false,
       webReactHmrVerified: true, hmrSourceRestored: true, sameDocumentPreserved: true,
@@ -661,6 +742,7 @@ export async function runBrowserProof({ state, artifactDir, timeoutMs = 180000 }
       network: { ...network, loopbackApplicationPortsOnly: true, fetchInterceptionEnabledBeforeNavigation: true,
         webSocketDestinationGuard: true, denyAllProxyWithoutDirectFallback: true },
       limitations: ["Screenshots require human visual review; DOM geometry is not full OpenCode TUI acceptance.",
+        "Visibility is sampled at five interior terminal points; it is not exhaustive visual or full-TUI certification.",
         "Synthetic owner was claimed earlier; this browser proof verifies ordinary login, not owner setup UI.",
         "No terminal command, model task, provider completion, API watch or package rebuild is performed here.",
         "Network protection combines target CDP interception with browser proxy rules; it is not an OS network sandbox."],

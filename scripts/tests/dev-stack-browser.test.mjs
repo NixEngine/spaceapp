@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import test from "node:test";
 import { assertChromeTempPath, assertUiObservation, browserArtifactRootAllowed, browserDirectoryLease, browserFailureDetails,
-  browserUrlAllowed, createStartupDiagnostics, inspectPng, mutateBadgeSource,
+  browserUrlAllowed, createSetupOverviewObservation, createStartupDiagnostics, inspectPng, mutateBadgeSource,
   removeOwnedBrowserDirectory } from "../dev-stack-browser.mjs";
 
 const state = { ports: { api: 5910, web: 5911 } };
-const observation = () => ({ paneCount: 1, badgeVisible: true, roomObserved: true,
+const observation = () => ({ paneCount: 1, badgeVisible: true, roomObserved: true, sampledTerminalPointsUnoccluded: true,
   status: "attached", loading: "false", hasError: "false", hasSession: "true", hasWebsocket: "true",
   width: 800, height: 600, screenWidth: 800, screenHeight: 600, canvasCount: 1, rowCount: 0 });
 
@@ -44,9 +44,52 @@ test("real UI guard expects attached source status with visible rendered xterm g
 test("HTTP/session RUNNING labels, missing render and error flags cannot become browser PASS", () => {
   for (const change of [{ status: "RUNNING" }, { status: "connecting" }, { hasError: "true" }, { loading: "true" },
     { paneCount: 0 }, { paneCount: 2 }, { badgeVisible: false }, { roomObserved: false },
-    { hasSession: "false" }, { hasWebsocket: "false" }, { width: 0 }, { height: 0 },
+    { hasSession: "false" }, { hasWebsocket: "false" }, { sampledTerminalPointsUnoccluded: false },
+    { sampledTerminalPointsUnoccluded: undefined }, { width: 0 }, { height: 0 },
     { screenWidth: 0 }, { canvasCount: 0, rowCount: 0 }]) {
     assert.throws(() => assertUiObservation({ ...observation(), ...change }), /DEV_STACK_BROWSER_UI_TERMINAL/u);
+  }
+});
+
+test("setup discovery awaits the original response and body completion, not terminal geometry", () => {
+  const value = createSetupOverviewObservation(state);
+  assert.equal(value.completedRequest(), null);
+  value.observe("Network.loadingFinished", { requestId: "unrelated" });
+  value.observe("Network.requestWillBeSent", { requestId: "original", request: {
+    method: "GET", url: "http://127.0.0.1:5911/api/setup/overview" } });
+  assert.equal(value.completedRequest(), null);
+  value.observe("Network.responseReceived", { requestId: "original", response: { status: 200 } });
+  assert.equal(value.completedRequest(), null);
+  value.observe("Network.loadingFinished", { requestId: "original" });
+  assert.equal(value.completedRequest(), "original");
+});
+
+test("foreign ports, POSTs and unrelated routes cannot satisfy setup discovery", () => {
+  const value = createSetupOverviewObservation(state);
+  for (const [method, url] of [["POST", "http://127.0.0.1:5911/api/setup/overview"],
+    ["GET", "http://127.0.0.1:4910/api/setup/overview"], ["GET", "https://external.invalid/api/setup/overview"],
+    ["GET", "http://127.0.0.1:5911/api/setup/finish"]]) {
+    value.observe("Network.requestWillBeSent", { requestId: "not-original", request: { method, url } });
+    value.observe("Network.responseReceived", { requestId: "not-original", response: { status: 200 } });
+    value.observe("Network.loadingFinished", { requestId: "not-original" });
+  }
+  assert.equal(value.completedRequest(), null);
+});
+
+test("setup discovery failure cannot be replaced by a later successful request", () => {
+  for (const failure of ["Network.loadingFailed", "HTTP_FAILURE"]) {
+    const value = createSetupOverviewObservation(state);
+    for (const id of ["first", "later"]) value.observe("Network.requestWillBeSent", { requestId: id,
+      request: { method: "GET", url: "http://127.0.0.1:5911/api/setup/overview" } });
+    value.observe(failure === "HTTP_FAILURE" ? "Network.responseReceived" : failure,
+      { requestId: "first", response: { status: 500 }, errorText: "PRIVATE_SYNTHETIC_SECRET" });
+    value.observe("Network.responseReceived", { requestId: "later", response: { status: 200 } });
+    value.observe("Network.loadingFinished", { requestId: "later" });
+    assert.throws(() => value.completedRequest(), error => {
+      assert.equal(error.message, "DEV_STACK_BROWSER_SETUP_DISCOVERY_FAILED");
+      assert.doesNotMatch(JSON.stringify(error), /PRIVATE_SYNTHETIC_SECRET/u);
+      return true;
+    });
   }
 });
 
