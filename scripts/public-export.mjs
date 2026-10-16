@@ -78,6 +78,22 @@ const publicDocs = new Set([
 export const publicRepositoryMaintainedFiles = new Set(["docs/security-model.md"]);
 
 const publicScripts = new Set([
+  // Complete source contributor stack; runtime/credentials remain git-ignored.
+  "scripts/dev-stack.mjs",
+  "scripts/dev-stack-state.mjs",
+  "scripts/dev-stack-config.mjs",
+  "scripts/dev-stack-process.mjs",
+  "scripts/dev-stack-wrapper.mjs",
+  "scripts/dev-stack-acceptance.mjs",
+  "scripts/dev-stack-ci.mjs",
+  "scripts/dev-stack-lifecycle.mjs",
+  "scripts/tests/dev-stack-lifecycle.test.mjs",
+  "scripts/tests/dev-stack-state.test.mjs",
+  "scripts/tests/dev-stack-config.test.mjs",
+  "scripts/tests/dev-stack-process.test.mjs",
+  "scripts/tests/dev-stack-wrapper.test.mjs",
+  "scripts/tests/dev-stack-acceptance.test.mjs",
+  "scripts/tests/dev-stack-runner.test.mjs",
   // Loaded by apps/api/src/cli-render-proof-fixture.ts (proof rooms); missing, that path failed (review F18).
   "scripts/cli-render-fixture.mjs",
   // Maintained here; listed so the CI re-export of this repository keeps them.

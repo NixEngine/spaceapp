@@ -27,7 +27,71 @@ packaging requires its normal toolchain and separate platform acceptance.
 Dependency installation may use the network; the smoke command below does not
 need a provider account, API key, Docker, PostgreSQL or Temporal.
 
-## First executed task, without a provider
+## Run the full app from source
+
+This contributor stack runs the API, web dev server, Temporal worker and CLI
+host from **this checkout**. Only PostgreSQL/pgvector and Temporal run in Docker.
+Use Node >=22.12 <23, npm, Docker with Compose v2 (`docker compose version`),
+and a C++ toolchain/Python/Make if `node-pty` needs a native build. Complete the
+locked `ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm ci` first. No operator installation,
+provider account or global OpenCode install is used.
+
+```sh
+npm run dev:stack                 # foreground, including a non-TTY terminal
+# Open the printed loopback URL, use the one-time token, create owner, sign in.
+# Open Getting Started and its OpenCode CLI pane.
+npm run dev:stack -- verify       # fresh synthetic test owner only; see below
+npm run dev:stack -- down         # another terminal; retain DB volume/state
+npm run dev:stack -- rebuild      # restart after changes in packages/* or worker
+npm run dev:stack -- reset        # destructive: ONLY this owned dev-stack state
+```
+
+Default loopback ports: API5910, web5911, PostgreSQL55432, Temporal57233. Override
+before first startup with `SPACE_DEV_API_PORT`, `SPACE_DEV_WEB_PORT`,
+`SPACE_DEV_POSTGRES_PORT`, `SPACE_DEV_TEMPORAL_PORT`. Ports must be distinct and
+not4910/4911. Once state exists, use its saved ports or explicitly stop/reset
+before changing them. Vite proxies API/terminal WebSockets to that stack's API.
+API source changes restart under `tsx watch`; web source changes hot reload.
+The single `rebuild` command rebuilds packages and restarts every source service.
+
+Each checkout gets an unpredictable Compose project and fixed `.dev-stack/`,
+git-ignored. Its ownership marker binds its canonical checkout path. Generated
+database password, session secret and setup token are0600, under0700 directories
+on POSIX. The owner token is the only secret deliberately printed; it is valid
+for initial owner setup for15minutes after API startup, not a dev-login shortcut.
+Do not share the token or commit/copy runtime files. OpenCode is pinned to the
+version declared in Dockerfile and installed only beneath that state directory.
+Its provider config/cache/home are also isolated there. Reaching its terminal
+does not establish model availability or a successful AI completion.
+
+On macOS, start Docker Desktop or Colima and confirm `docker info` works from the
+same terminal. The runner uses the existing Docker context without passing its
+configuration to application/provider children. On Windows11, use WSL2 with a
+Linux filesystem checkout (for example `~/spaceapp`), Node22 and Docker Desktop
+WSL integration or a working Docker daemon in that distribution. Native Windows
+is refused, and no Windows feature, WSL distribution or daemon is installed by
+the stack. Keep the checkout path short enough for the Unix CLI socket
+`.dev-stack/h.sock` (at most100bytes); do not use an existing operator socket.
+
+Readiness requires `/readyz?strict=1`, HTTP200 **and** `ok:true` with PostgreSQL,
+worker and CLI host RUNNING. The supervisor reports a child exit and stops the
+other owned children; Docker failures are failures, not successful cleanup.
+`down/reset` compare process creation identity before signalling. An unknown,
+foreign or altered state, reused PID, orphan group, missing ownership receipt,
+remaining resource or broken/outside symlink refuses cleanup for inspection.
+Do not delete the lock or broaden paths to suppress such a failure. This is a
+trusted-local-checkout guard, not a hostile-writer or power-loss guarantee.
+
+`verify` is intended for an isolated fresh test checkout. It creates a synthetic
+owner through the ordinary one-time setup, signs in, observes the real starter
+room, opens OpenCode through the real source CLI host and inspects the terminal
+transport. Never point it at personal/operator data. This probe is not a browser
+screenshot, model task, cross-platform execution or full acceptance by itself.
+The full issue65 acceptance additionally requires actual Linux and macOS/WSL2
+output, visible UI/hot-reload/failure/cleanup evidence and the normal repository
+checks; do not call the feature accepted from helper tests or a prepared CI file.
+
+### First executed task, without a provider
 
 ```sh
 npm run smoke:offline

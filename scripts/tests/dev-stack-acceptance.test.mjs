@@ -1,0 +1,308 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { join } from "node:path";
+import {
+  acceptanceOwner, assertOwner, assertReadiness, assertSession, assertStarterRoom,
+  createTerminalObservation, runAcceptance, selectStarterPane, terminalUrl,
+} from "../dev-stack-acceptance.mjs";
+
+const project = `space-dev-${"a".repeat(24)}`;
+const ownerState = { project, secrets: { sessionSecret: "b".repeat(64) } };
+const email = acceptanceOwner(ownerState).email;
+const expected = { paneId: "pane:open-code", roomId: "room:getting-started", cwd: "/tmp/source/.dev-stack/workspaces" };
+const sessionId = "cli:acceptance";
+const ready = () => ({ status: 200, body: { ok: true, dependencies: {
+  store: "postgres", runtimeStore: "postgres", database: "RUNNING", worker: "RUNNING", cliHost: "RUNNING",
+  temporal: "disabled",
+} } });
+const auth = () => ({ status: 200, body: {
+  isAuthenticated: true, isSetupRequired: false, user: { id: "user:owner", email, role: "ADMIN" },
+} });
+const session = () => ({ status: 200, body: {
+  session: { sessionId, ...expected, runtimeId: "cli:opencode", purpose: "NORMAL", isActive: true,
+    status: "IDLE", statusReason: "CLI session allocated; waiting for terminal transport attach.",
+    endedAt: null, exitCode: null },
+  runtime: { id: "cli:opencode", capabilities: ["CLI"], detectedCommandPath: "/tmp/source/.dev-stack/bin/opencode" },
+  transcript: [], websocket: { paneId: expected.paneId, sessionId, token: "t".repeat(43),
+    expiresAt: "2030-01-01T00:00:00.000Z" },
+} });
+const hello = () => ({ type: "ready", paneId: expected.paneId, sessionId, runtimeId: "cli:opencode",
+  protocolVersion: 2, clientMode: "INTERACTIVE", controlState: "CONTROLLER", leaseId: "lease:ours",
+  heartbeatIntervalMs: 5000 });
+function observer(options) { return createTerminalObservation({ ...expected, sessionId }, options); }
+function send(target, value) { target.observe(JSON.stringify(value)); }
+function complete(target) {
+  send(target, hello());
+  send(target, { type: "control_state", controlState: "CONTROLLER", leaseId: "lease:ours" });
+  send(target, { type: "status", status: "RUNNING", statusReason: "CLI session attached." });
+  send(target, { type: "output", stream: "stdout", data: "\u001b[32mOpenCode terminal\u001b[0m\r\n" });
+  send(target, { type: "pong" });
+}
+
+test("readiness requires the actual postgres, workflow pollers and host shape", () => {
+  assert.equal(assertReadiness(ready()), true);
+});
+test("HTTP 200 with ok=false never passes readiness", () => {
+  const value = ready(); value.body.ok = false;
+  assert.throws(() => assertReadiness(value), /NOT_READY/u);
+});
+test("strict health status failure is rejected even if body claims success", () => {
+  const value = ready(); value.status = 503;
+  assert.throws(() => assertReadiness(value), /NOT_READY/u);
+});
+for (const [key, bad] of [["store", "memory"], ["runtimeStore", "memory"], ["database", "in-memory"],
+  ["worker", "NO_POLLERS"], ["worker", "disabled"], ["cliHost", "UNAVAILABLE"], ["cliHost", "disabled"]]) {
+  test(`readiness rejects ${key}=${bad}`, () => {
+    const value = ready(); value.body.dependencies[key] = bad;
+    assert.throws(() => assertReadiness(value), /NOT_READY/u);
+  });
+}
+test("a services-shaped fixture does not replace actual dependencies", () => {
+  const value = ready(); value.body.services = value.body.dependencies; delete value.body.dependencies;
+  assert.throws(() => assertReadiness(value), /NOT_READY/u);
+});
+test("synthetic owner credentials are strong, deterministic and checkout-specific", () => {
+  const first = acceptanceOwner(ownerState);
+  assert.deepEqual(first, acceptanceOwner(ownerState));
+  assert.match(first.email, /^acceptance\+[a-f0-9]{24}@spaceapp\.invalid$/u);
+  assert.ok(first.password.length >= 50);
+  assert.match(first.password, /[A-Z]/u); assert.match(first.password, /[a-z]/u);
+  assert.match(first.password, /[0-9]/u); assert.match(first.password, /[^a-zA-Z0-9]/u);
+  assert.notEqual(first.password, acceptanceOwner({ ...ownerState, secrets: { sessionSecret: "c".repeat(64) } }).password);
+  assert.notEqual(first.password, acceptanceOwner({ ...ownerState, project: `space-dev-${"d".repeat(24)}` }).password);
+});
+test("synthetic credentials refuse missing or malformed checkout secrets", () => {
+  assert.throws(() => acceptanceOwner({ project }), /INVALID_OWNER_STATE/u);
+  assert.throws(() => acceptanceOwner({ ...ownerState, project: "stable" }), /INVALID_OWNER_STATE/u);
+});
+test("owner assertion accepts actual owner and rejects proof or dev user lookalikes", () => {
+  assert.equal(assertOwner(auth(), email), "user:owner");
+  for (const user of [{ id: "user:dev" }, { role: "OPERATOR" }, { email: "other@spaceapp.invalid" },
+    { proofScope: "READ_ONLY" }, { automationScope: "APP_DIAGNOSTICS" }]) {
+    const value = auth(); Object.assign(value.body.user, user);
+    assert.throws(() => assertOwner(value, email), /OWNER_AUTH/u);
+  }
+});
+test("starter room is the original owner's Getting Started workspace", () => {
+  const value = { status: 200, body: { room: { id: expected.roomId, name: "Getting Started", kind: "WORKSPACE",
+    archivedAt: null, ownerUserId: "user:owner" }, onboarding: { starterRoomId: expected.roomId } } };
+  assert.equal(assertStarterRoom(value, expected.roomId), expected.roomId);
+  assert.throws(() => assertStarterRoom(value, "room:foreign"), /STARTER_ROOM/u);
+  value.body.room.kind = "AGENT_PROOF";
+  assert.throws(() => assertStarterRoom(value), /STARTER_ROOM/u);
+});
+test("select only one open original OpenCode terminal, not a generated substitute", () => {
+  const pane = { id: expected.paneId, roomId: expected.roomId, title: "OpenCode CLI", mode: "TERMINAL",
+    terminalRuntimeId: "cli:opencode", isClosed: false };
+  const value = { status: 200, body: { data: [pane] } };
+  assert.equal(selectStarterPane(value, expected.roomId).id, expected.paneId);
+  value.body.data.push({ ...pane, id: "pane:duplicate" });
+  assert.throws(() => selectStarterPane(value, expected.roomId), /STARTER_PANE/u);
+  value.body.data = [{ ...pane, terminalRuntimeId: "cli:codex" }];
+  assert.throws(() => selectStarterPane(value, expected.roomId), /STARTER_PANE/u);
+});
+test("allocated IDLE is valid before attach but not evidence of RUNNING", () => {
+  assert.equal(assertSession(session(), expected).sessionId, sessionId);
+  assert.throws(() => assertSession(session(), expected, { requireRunning: true }), /CLI_SESSION/u);
+  const value = session(); value.body.session.status = "RUNNING";
+  assert.equal(assertSession(value, { ...expected, sessionId }, { requireRunning: true }).sessionId, sessionId);
+});
+test("ERROR with reason containing 'session' is not a positive status", () => {
+  const value = session(); value.body.session.status = "ERROR";
+  value.body.session.statusReason = "CLI session could not start.";
+  assert.throws(() => assertSession(value, expected), /CLI_SESSION/u);
+});
+for (const patch of [{ cwd: "/etc" }, { purpose: "LOGIN" }, { isActive: false }, { runtimeId: "cli:codex" },
+  { status: "EXITED" }, { status: "INTERRUPTING" }, { paneId: "pane:other" }, { exitCode: 1 }]) {
+  test(`session rejects nonmatching state ${JSON.stringify(patch)}`, () => {
+    const value = session(); Object.assign(value.body.session, patch);
+    assert.throws(() => assertSession(value, expected), /CLI_SESSION/u);
+  });
+}
+test("session rejects a missing native command and synthetic transcript output", () => {
+  const value = session(); value.body.runtime.detectedCommandPath = null;
+  assert.throws(() => assertSession(value, expected), /CLI_SESSION/u);
+  const another = session(); another.body.transcript = [{ stream: "system", data: "session allocated" }];
+  assert.throws(() => assertSession(another, expected), /CLI_SESSION/u);
+});
+test("WS ticket must bind the pane/session and cannot be a proof ticket", () => {
+  for (const patch of [{ paneId: "pane:other" }, { sessionId: "session:other" }, { token: "short" },
+    { expiresAt: "not a date" }, { proofScope: "READ_ONLY" }]) {
+    const value = session(); Object.assign(value.body.websocket, patch);
+    assert.throws(() => assertSession(value, expected), /CLI_TICKET/u);
+  }
+});
+test("WS v2 query has unique UUID identities, real ticket and bounded dimensions", () => {
+  const { url, identity } = terminalUrl("http://127.0.0.1:5910", session().body);
+  assert.equal(url.protocol, "ws:"); assert.equal(url.hostname, "127.0.0.1");
+  assert.equal(url.pathname, "/api/panes/pane%3Aopen-code/cli/terminal");
+  assert.equal(url.searchParams.get("token"), session().body.websocket.token);
+  assert.equal(url.searchParams.get("sessionId"), sessionId);
+  assert.equal(url.searchParams.get("protocolVersion"), "2");
+  assert.equal(url.searchParams.get("clientMode"), "INTERACTIVE");
+  assert.equal(url.searchParams.get("initialCols"), "100");
+  assert.equal(url.searchParams.get("initialRows"), "30");
+  assert.equal(new Set(Object.values(identity)).size, 4);
+  for (const value of Object.values(identity)) assert.match(value, /^[0-9a-f-]{36}$/u);
+  assert.throws(() => terminalUrl("http://example.org:5910", session().body), /NONLOCAL_ORIGIN/u);
+});
+test("PTY evidence requires ready, RUNNING, pong and actual printable output", () => {
+  const value = observer(); complete(value);
+  const result = value.snapshot();
+  assert.equal(result.complete, true); assert.equal(result.openCodeBrandingObserved, true);
+  assert.equal(result.outputFrames, 1); assert.ok(result.outputBytes > result.printableCharacters);
+  assert.equal(Object.hasOwn(result, "output"), false);
+});
+test("ready/status messages alone do not fabricate terminal bytes", () => {
+  const value = observer(); send(value, hello());
+  send(value, { type: "status", status: "RUNNING", statusReason: "session attached" });
+  send(value, { type: "pong" });
+  assert.equal(value.snapshot().complete, false);
+  send(value, { type: "output", stream: "stdout", data: "\u001b[2J\r\n" });
+  assert.equal(value.snapshot().complete, false);
+});
+test("branding is an optional observation, not a full TUI assertion", () => {
+  const value = observer(); send(value, hello());
+  send(value, { type: "output", stream: "stdout", data: "Welcome to the terminal" });
+  send(value, { type: "status", status: "RUNNING" }); send(value, { type: "pong" });
+  assert.equal(value.snapshot().complete, true);
+  assert.equal(value.snapshot().openCodeBrandingObserved, false);
+});
+for (const message of [{ type: "status", status: "ERROR", statusReason: "session failed" },
+  { type: "status", status: "EXITED", exitCode: 0 }, { type: "status", status: "INTERRUPTING" },
+  { type: "error", code: "CLI_SESSION_FAILED", message: "secret must not appear in error" },
+  { type: "session_replaced", sessionId: "session:other" },
+  { type: "control_state", controlState: "HELD_BY_OTHER", leaseId: "lease:other" },
+  { type: "control_revoked", leaseId: "lease:ours", reason: "TAKEN_OVER" }]) {
+  test(`terminal rejects ${message.type}/${message.status ?? message.controlState ?? "failure"} even after initial success`, () => {
+    const value = observer(); complete(value);
+    assert.throws(() => send(value, message), error => {
+      assert.match(error.message, /^DEV_STACK_ACCEPTANCE_/u);
+      assert.ok(!error.message.includes("secret")); return true;
+    });
+    assert.throws(() => value.snapshot(), /^Error: DEV_STACK_ACCEPTANCE_/u);
+  });
+}
+test("mismatched session, observer or v1 cannot pass as controlled WS v2", () => {
+  for (const patch of [{ sessionId: "other" }, { paneId: "other" }, { runtimeId: "cli:codex" },
+    { protocolVersion: 1 }, { clientMode: "OBSERVER" }, { controlState: "AVAILABLE" }, { leaseId: null }]) {
+    assert.throws(() => send(observer(), { ...hello(), ...patch }), /TERMINAL_READY/u);
+  }
+});
+test("transport bounds reject oversized output, floods and malformed frames", () => {
+  const value = observer({ maxOutputBytes: 4 }); send(value, hello());
+  assert.throws(() => send(value, { type: "output", stream: "stdout", data: "12345" }), /TERMINAL_OUTPUT_LIMIT/u);
+  const flood = observer({ maxMessages: 1 }); send(flood, hello());
+  assert.throws(() => send(flood, { type: "pong" }), /TERMINAL_MESSAGE_LIMIT/u);
+  assert.throws(() => observer().observe("not JSON"), /TERMINAL_JSON/u);
+  assert.throws(() => observer().observe(Buffer.from("{}"), true), /TERMINAL_MESSAGE_LIMIT/u);
+});
+test("known source proof fixture bytes are never live terminal evidence", () => {
+  const value = observer(); send(value, hello());
+  assert.throws(() => send(value, { type: "output", stream: "stdout", data: "SPACE_WARM_READY" }),
+    /TERMINAL_SYNTHETIC_OUTPUT/u);
+});
+
+// Stubbed fetch checks orchestration failures without opening sockets, importing
+// ws, reading secrets from disk, or running any real stack/provider operation.
+function syntheticState() {
+  return { ...ownerState, repoRoot: process.cwd(), stateDir: join(process.cwd(), ".dev-stack"),
+    ports: { api: 5910, web: 5911, postgres: 55432, temporal: 57233 },
+    secrets: { ...ownerState.secrets, setupToken: "c".repeat(64) } };
+}
+function jsonResponse(body, status = 200, headers = {}) {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
+}
+async function withFetchStub(stub, operation) {
+  const original = globalThis.fetch;
+  globalThis.fetch = stub;
+  try { return await operation(); }
+  finally { globalThis.fetch = original; }
+}
+test("invalid state or stable ports fail before any fetch", async () => {
+  await withFetchStub(() => { assert.fail("No transport is allowed for invalid state"); }, async () => {
+    const state = syntheticState(); state.ports.api = 4910;
+    await assert.rejects(runAcceptance({ state }), /INVALID_PORTS/u);
+    await assert.rejects(runAcceptance({ state: { ...state, repoRoot: undefined } }), /INVALID_STATE/u);
+  });
+});
+test("an already claimed foreign owner is not reclaimed or reset", async () => {
+  const paths = [];
+  await withFetchStub(async url => {
+    paths.push(url.pathname);
+    if (url.pathname === "/readyz") return jsonResponse(ready().body);
+    if (url.pathname === "/api/setup/status") return jsonResponse({ setupRequired: false, expiresAt: null });
+    if (url.pathname === "/api/auth/login") return jsonResponse({ error: { code: "INVALID_CREDENTIALS" } }, 401);
+    assert.fail("Unexpected operation after owner conflict");
+  }, async () => {
+    await assert.rejects(runAcceptance({ state: syntheticState() }), /OWNER_AUTH/u);
+  });
+  assert.deepEqual(paths, ["/readyz", "/api/setup/status", "/api/auth/login"]);
+});
+test("fresh setup claim is attempted only once and payload errors are not echoed", async () => {
+  let claims = 0;
+  await withFetchStub(async (url, options) => {
+    if (url.pathname === "/readyz") return jsonResponse(ready().body);
+    if (url.pathname === "/api/setup/status") return jsonResponse({ setupRequired: true, expiresAt: null });
+    if (url.pathname === "/api/setup/claim") {
+      claims++;
+      const body = JSON.parse(options.body);
+      assert.equal(body.email, email);
+      assert.ok(body.password.length >= 50);
+      assert.equal(body.token, syntheticState().secrets.setupToken);
+      return jsonResponse({ error: { message: "private-data-never-logged" } }, 409);
+    }
+    assert.fail("Claim failures must not cause login, reset or another claim");
+  }, async () => {
+    await assert.rejects(runAcceptance({ state: syntheticState() }), error => {
+      assert.equal(error.message, "DEV_STACK_ACCEPTANCE_OWNER_AUTH"); return true;
+    });
+  });
+  assert.equal(claims, 1);
+});
+test("successful JSON auth without a real session cookie does not pass", async () => {
+  await withFetchStub(async url => {
+    if (url.pathname === "/readyz") return jsonResponse(ready().body);
+    if (url.pathname === "/api/setup/status") return jsonResponse({ setupRequired: false, expiresAt: null });
+    if (url.pathname === "/api/auth/login") return jsonResponse(auth().body);
+    assert.fail("Missing session cookie must stop before authenticated mutations");
+  }, async () => {
+    await assert.rejects(runAcceptance({ state: syntheticState() }), /SESSION_COOKIE/u);
+  });
+});
+test("a web proxy reaching a different owner is rejected before WS attachment", async () => {
+  const mutations = [];
+  await withFetchStub(async (url, options) => {
+    if (url.pathname === "/readyz") return jsonResponse(ready().body);
+    if (url.pathname === "/api/setup/status") return jsonResponse({ setupRequired: false, expiresAt: null });
+    if (url.pathname === "/api/auth/login") return jsonResponse(auth().body, 200,
+      { "set-cookie": "space_session_dev=synthetic-cookie; HttpOnly; Path=/; SameSite=Lax" });
+    if (url.pathname === "/api/auth/me") {
+      assert.equal(options.headers.Cookie, "space_session_dev=synthetic-cookie");
+      const body = auth().body;
+      if (url.port === "5911") body.user.email = "foreign@spaceapp.invalid";
+      return jsonResponse(body);
+    }
+    if (url.pathname === "/api/auth/csrf") return jsonResponse({ headerName: "x-space-csrf-token", csrfToken: "s".repeat(32) });
+    if (options.method === "POST") {
+      mutations.push(url.pathname);
+      assert.equal(options.headers["x-space-csrf-token"], "s".repeat(32));
+    }
+    if (url.pathname === "/api/setup/starter-room") return jsonResponse({ room: {
+      id: expected.roomId, name: "Getting Started", kind: "WORKSPACE", archivedAt: null, ownerUserId: "user:owner",
+    }, onboarding: { starterRoomId: expected.roomId } });
+    if (url.pathname === "/api/panes") return jsonResponse({ data: [{ id: expected.paneId, roomId: expected.roomId,
+      mode: "TERMINAL", terminalRuntimeId: "cli:opencode", title: "OpenCode CLI", isClosed: false }] });
+    if (url.pathname.endsWith("/cli/session")) {
+      const body = session().body; body.session.cwd = join(syntheticState().stateDir, "workspaces");
+      assert.equal(JSON.parse(options.body).cwd, body.session.cwd);
+      assert.equal(JSON.parse(options.body).includeTranscript, false);
+      return jsonResponse(body);
+    }
+    if (url.pathname === "/") return new Response('<div id="root"></div><script type="module" src="/src/main.tsx"></script>');
+    assert.fail("Unexpected route in synthetic orchestration test");
+  }, async () => {
+    await assert.rejects(runAcceptance({ state: syntheticState() }), /OWNER_AUTH/u);
+  });
+  assert.deepEqual(mutations, ["/api/setup/starter-room", `/api/panes/${encodeURIComponent(expected.paneId)}/cli/session`]);
+});

@@ -1,0 +1,52 @@
+name: Contributor source stack
+
+on:
+  pull_request:
+    paths:
+      - "scripts/dev-stack*.mjs"
+      - "scripts/tests/dev-stack*.test.mjs"
+      - "apps/web/vite.config.ts"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/dev-stack.yml"
+  push:
+    branches: ["feat/issue-65-dev-stack-nexo"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contributor-stack-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-source-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Install exact locked source dependencies
+        run: npm ci
+      - name: Source stack unit and negative controls
+        run: npm run test:dev-stack
+      - name: Type and dependency checks
+        run: npm run check
+      - name: Real owner, OpenCode transport, worker failure and owned cleanup
+        run: node scripts/dev-stack-ci.mjs
+      - name: Preserve synthetic source-run diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: contributor-source-stack-${{ github.run_id }}
+          path: ${{ runner.temp }}/spaceapp-dev-stack-*.txt
+          retention-days: 1
+          if-no-files-found: ignore
