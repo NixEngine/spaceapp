@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { isAbsolute, sep } from "node:path";
+import { performance } from "node:perf_hooks";
 
 const digest = value => createHash("sha256").update(value).digest("hex");
 
@@ -119,5 +120,69 @@ export function assertGroupsGone(records, { kill = process.kill } = {}) {
     try { kill(-record.pgid, 0); }
     catch (error) { if (error.code === "ESRCH") continue; throw error; }
     throw new Error("Managed process group remains; cleanup is incomplete.");
+  }
+}
+
+/** One action per immutable launch receipt; a delivered signal is never exit proof. */
+export function createShutdownSignals({ signalGroup = signalOwnedGroup } = {}) {
+  const attempts = new Map();
+  return {
+    signalAll(records) {
+      for (const record of records) {
+        if (attempts.has(record)) continue;
+        const attempt = { record };
+        attempts.set(record, attempt); // Mark before the call, including a reentrant signal callback.
+        try { attempt.result = signalGroup(record); }
+        catch (error) { attempt.error = error; }
+      }
+    },
+    failures() { return [...attempts.values()].filter(attempt => Object.hasOwn(attempt, "error")); },
+  };
+}
+
+/** EPERM is an inconclusive probe, never absence. Recheck within the original deadline. */
+export async function waitGroupsGone(records, { timeoutMs = 10_000, intervalMs = 250,
+  label = "child shutdown", clock = () => performance.now(),
+  pause = milliseconds => new Promise(done => setTimeout(done, milliseconds)),
+  assertGone = assertGroupsGone, signal } = {}) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 10_000
+    || !Number.isFinite(intervalMs) || intervalMs <= 0
+    || !["child shutdown", "owned child process groups to exit"].includes(label)) {
+    throw new Error("Invalid owned group wait.");
+  }
+  const deadline = clock() + timeoutMs;
+  let lastError, firstPermissionError;
+  while (true) {
+    signal?.throwIfAborted();
+    if (lastError && clock() >= deadline) {
+      if (lastError.code === "EPERM") throw firstPermissionError;
+      throw new Error(`Timed out waiting for ${label}.`);
+    }
+    try { assertGone(records); return; }
+    catch (error) {
+      if (error?.code !== "EPERM" && error?.message !== "Managed process group remains; cleanup is incomplete.") throw error;
+      if (error.code === "EPERM") firstPermissionError ??= error;
+      lastError = error;
+    }
+    const remaining = deadline - clock();
+    if (!Number.isFinite(remaining)) throw new Error("Invalid owned group wait clock.");
+    if (remaining <= 0) {
+      if (lastError.code === "EPERM") throw firstPermissionError;
+      throw new Error(`Timed out waiting for ${label}.`);
+    }
+    await pause(Math.min(intervalMs, remaining));
+  }
+}
+
+/** A failed signal never skips the independent all-groups observation or permits state cleanup. */
+export async function verifyShutdownGroups(records, shutdown, options = {}) {
+  const failures = shutdown.failures().map(failure => failure.error);
+  try { await waitGroupsGone(records, options); }
+  catch (error) {
+    if (!failures.length) throw error; // Keep a lone group/cancellation failure's identity and code.
+    failures.push(error);
+  }
+  if (failures.length) {
+    throw new AggregateError(failures, "Owned child shutdown failed; runtime ownership retained.");
   }
 }

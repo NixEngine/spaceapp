@@ -10,6 +10,7 @@ import { runAcceptance, assertReadiness, sourceStartupTimeoutMs } from "./dev-st
 import { runBrowserProof } from "./dev-stack-browser.mjs";
 import { runApiReloadProof, runPackageRebuildProof, createOwnedAppendLog, openOwnedAppendLog, readOwnedLog } from "./dev-stack-reload.mjs";
 import { supervisorExitRecord } from "./dev-stack-diagnostics.mjs";
+import { resetAfterObservedExit } from "./dev-stack-lifecycle.mjs";
 
 // Explicit isolated POSIX CI only. This is not an operator-host diagnostic.
 if (!["linux", "darwin"].includes(process.platform) || process.env.CI !== "true") {
@@ -169,7 +170,7 @@ try {
   // A failed cleanup remains a failed job. Do not suppress reset/resource errors
   // or declare a clean environment merely because the leader is gone.
   if (state && existsSync(state.stateDir)) {
-    try { reset(); } catch (error) { cleanupFailures.push(error); }
+    try { resetAfterObservedExit(supervisor.exit, reset); } catch (error) { cleanupFailures.push(error); }
   }
   console.error(JSON.stringify({ ...supervisorExitRecord(supervisor.exit),
     event: "FINAL_CURRENT_EXIT", observed: supervisor.exit !== undefined }));

@@ -10,9 +10,9 @@ import { homedir } from "node:os";
 import { isDeepStrictEqual } from "node:util";
 import { initState, readState, removeState } from "./dev-stack-state.mjs";
 import { resolvePorts, readImages, readOpenCodeVersion, composeConfig, serviceEnv } from "./dev-stack-config.mjs";
-import { processIdentity, sameProcess, signalOwnedGroup, signalOwnedProcess, assertGroupsGone } from "./dev-stack-process.mjs";
+import { processIdentity, sameProcess, signalOwnedProcess, createShutdownSignals, waitGroupsGone, verifyShutdownGroups } from "./dev-stack-process.mjs";
 import { openCodeWrapper } from "./dev-stack-wrapper.mjs";
-import { acquireLifecycleLock, releaseLifecycleLock } from "./dev-stack-lifecycle.mjs";
+import { withLifecycleAdmission } from "./dev-stack-lifecycle.mjs";
 import { prepareDevPtyDependency } from "./dev-stack-native.mjs";
 import { cleanupFailureRecord } from "./dev-stack-diagnostics.mjs";
 
@@ -42,9 +42,10 @@ export async function runObservedStep(name, run, { clock = () => performance.now
   return result;
 }
 
-export async function waitUntil(predicate, { timeoutMs = 180_000, intervalMs = 250, label = "condition" } = {}) {
+export async function waitUntil(predicate, { timeoutMs = 180_000, intervalMs = 250, label = "condition", signal } = {}) {
   const deadline = performance.now() + timeoutMs;
   do {
+    signal?.throwIfAborted();
     if (await predicate()) return;
     await delay(intervalMs);
   } while (performance.now() < deadline);
@@ -178,7 +179,8 @@ function readRuntime(state) {
   return runtime;
 }
 
-async function stopState(state, reset = false) {
+async function stopState(state, reset = false, { signal } = {}) {
+  signal?.throwIfAborted();
   validateOwnedCompose(state);
   const runtime = readRuntime(state);
   if (runtime) {
@@ -189,20 +191,19 @@ async function stopState(state, reset = false) {
       if (!current) return true;
       if (current.startId !== runtime.supervisor.startId) throw new Error("Supervisor PID was reused; refusing teardown escalation.");
       return false;
-    }, { timeoutMs: 30_000, label: "supervisor shutdown" });
-    for (const record of runtime.children) {
-      if (processIdentity(record.pid)) signalOwnedGroup(record);
-    }
-    await waitUntil(() => {
-      try { assertGroupsGone(runtime.children); return true; }
-      catch (error) { if (!error.message.includes("remains")) throw error; return false; }
-    }, { timeoutMs: 10_000, label: "owned child process groups to exit" });
+    }, { timeoutMs: 30_000, label: "supervisor shutdown", signal });
+    signal?.throwIfAborted();
+    const shutdown = createShutdownSignals();
+    shutdown.signalAll(runtime.children);
+    await verifyShutdownGroups(runtime.children, shutdown, { timeoutMs: 10_000, label: "owned child process groups to exit", signal });
   } else if (existsSync(paths(state).lock)) {
     throw new Error("A running lock has no complete process receipt; inspect it before recovery. No automatic deletion or PID guessing.");
   }
+  signal?.throwIfAborted();
   if (!existsSync(paths(state).compose)) throw new Error("Owned compose file is missing; refusing to guess cleanup targets.");
   dockerOutput(state, composeArguments(state, "down", "--remove-orphans", ...(reset ? ["--volumes"] : [])));
   assertDockerGone(state, reset);
+  // No cancellation point inside the runtime/running-lock finalization sequence.
   removeClosedSocket(state);
   if (runtime) {
     rmSync(paths(state).runtime, { force: true });
@@ -213,12 +214,13 @@ async function stopState(state, reset = false) {
     "dev-stack down: owned processes and containers stopped; state and database volume retained.");
 }
 
-async function up(state, releaseAdmission = () => {}) {
+async function up(state, releaseAdmission = () => {}, handoffSignals = () => {}) {
   const location = paths(state);
   mkdirSync(location.lock, { mode: 0o700 }); // Exclusive; never remove a pre-existing lock.
   const children = new Map();
   const receipts = [];
   const errors = [];
+  const shutdown = createShutdownSignals();
   let stopping = false;
   let ownershipLost = false;
   let supervisor;
@@ -264,7 +266,7 @@ async function up(state, releaseAdmission = () => {}) {
       child.kill("SIGTERM"); // Direct handle from this launch, not a guessed persisted PID.
       throw new Error(`${name} lacks an observed private process identity; shutdown cannot be certified.`);
     }
-    receipts.push({ name, ...record });
+    receipts.push(Object.freeze({ name, ...record }));
     save();
     return { child, completion };
   };
@@ -278,13 +280,12 @@ async function up(state, releaseAdmission = () => {}) {
   };
   const stop = () => {
     stopping = true;
-    for (const record of receipts) {
-      try { signalOwnedGroup(record); } catch (error) { errors.push(error); }
-    }
+    shutdown.signalAll(receipts);
   };
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
   try {
+    handoffSignals(); // Existing up handlers cover signals before admission scope is removed.
     privateWrite(location.compose, JSON.stringify(composeConfig(state, readImages(repoRoot)), null, 2) + "\n");
     const env = serviceEnv(state);
     if (Buffer.byteLength(join(state.stateDir, "h.sock")) > 100) {
@@ -342,15 +343,12 @@ async function up(state, releaseAdmission = () => {}) {
       console.error(JSON.stringify(cleanupFailureRecord({ stage, error, ...(childName ? { childName } : {}) })));
     };
     if (ownershipLost) cleanupErrors.push(new Error("A launched child's process identity was not established; retain receipts for recovery."));
-    for (const record of receipts) {
-      try { signalOwnedGroup(record); }
-      catch (error) { recordCleanupFailure("SIGNAL_CHILD_GROUP", error, record.name); }
+    shutdown.signalAll(receipts);
+    for (const failure of shutdown.failures()) {
+      recordCleanupFailure("SIGNAL_CHILD_GROUP", failure.error, failure.record?.name);
     }
     try {
-      await waitUntil(() => {
-        try { assertGroupsGone(receipts); return true; }
-        catch (error) { if (!error.message.includes("remains")) throw error; return false; }
-      }, { timeoutMs: 10_000, label: "child shutdown" });
+      await waitGroupsGone(receipts, { timeoutMs: 10_000, label: "child shutdown" });
     } catch (error) { recordCleanupFailure("WAIT_CHILD_GROUPS", error); }
     try {
       if (existsSync(location.compose)) {
@@ -380,12 +378,7 @@ export async function main(args = process.argv.slice(2)) {
   if (process.platform === "win32") throw new Error("Run the contributor stack inside Windows11 WSL2, not native Windows. No Windows feature is installed automatically.");
   const [major, minor] = process.versions.node.split(".").map(Number);
   if (major !== 22 || minor < 12) throw new Error("This checkout requires Node >=22.12 <23.");
-  const admission = acquireLifecycleLock(repoRoot);
-  let released = false;
-  const release = () => {
-    if (!released) { releaseLifecycleLock(admission); released = true; }
-  };
-  try {
+  return await withLifecycleAdmission(repoRoot, async ({ signal, checkCancelled, releaseAdmission, handoffToUp }) => {
     if (action === "up") {
       const ports = resolvePorts(process.env);
       if (existsSync(join(repoRoot, ".dev-stack"))) {
@@ -393,17 +386,20 @@ export async function main(args = process.argv.slice(2)) {
         if (existsSync(paths(existing).lock)) throw new Error("Dev stack is already running or has retained recovery state; inspect down/reset before starting.");
       }
       console.log(`dev-stack native prerequisite: ${JSON.stringify(prepareDevPtyDependency(repoRoot))}`);
-      return await up(initState(repoRoot, ports), release);
+      checkCancelled();
+      return await up(initState(repoRoot, ports), releaseAdmission, handoffToUp);
     }
     const state = readState(repoRoot);
-    if (action === "down" || action === "reset") return await stopState(state, action === "reset");
+    if (action === "down" || action === "reset") return await stopState(state, action === "reset", { signal });
     if (action === "rebuild") {
       console.log(`dev-stack native prerequisite: ${JSON.stringify(prepareDevPtyDependency(state.repoRoot))}`);
-      await stopState(state); return await up(state, release);
+      await stopState(state, false, { signal });
+      checkCancelled();
+      return await up(state, releaseAdmission, handoffToUp);
     }
     const { runAcceptance } = await import("./dev-stack-acceptance.mjs");
     console.log(JSON.stringify(await runAcceptance({ state }), null, 2));
-  } finally { release(); }
+  });
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

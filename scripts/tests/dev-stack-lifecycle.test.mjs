@@ -6,7 +6,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { acquireLifecycleLock, releaseLifecycleLock } from "../dev-stack-lifecycle.mjs";
+import { EventEmitter } from "node:events";
+import { acquireLifecycleLock, releaseLifecycleLock, withLifecycleAdmission,
+  resetAfterObservedExit } from "../dev-stack-lifecycle.mjs";
+import { waitGroupsGone } from "../dev-stack-process.mjs";
 
 function fixture(t) {
   const base = mkdtempSync(join(tmpdir(), "space-lifecycle-"));
@@ -235,4 +238,155 @@ test("private POSIX permissions are generated and required before release", {
   chmodSync(lease.ownerPath, 0o644);
   assert.throws(() => releaseLifecycleLock(lease), { code: "DEV_STACK_LIFECYCLE_PERMISSIONS" });
   assert.equal(existsSync(lease.ownerPath), true);
+});
+
+test("cancellation handler exists before acquisition and exact acquired lease is still released", async () => {
+  const events = new EventEmitter(), lease = Object.freeze({ ownedFixture: true });
+  let released = 0, externalSignals = 0;
+  const external = () => { externalSignals++; };
+  events.on("SIGTERM", external);
+  await assert.rejects(withLifecycleAdmission("unused-injected-root", () => assert.fail("cancelled before work"), {
+    events,
+    acquire: () => {
+      assert.equal(events.listenerCount("SIGTERM"), 2);
+      assert.equal(events.listenerCount("SIGINT"), 1);
+      events.emit("SIGTERM"); return lease;
+    },
+    release: actual => { assert.equal(actual, lease); released++; },
+  }), { code: "DEV_STACK_OPERATION_CANCELLED" });
+  assert.equal(released, 1); assert.equal(externalSignals, 1);
+  assert.equal(events.listenerCount("SIGTERM"), 1); assert.equal(events.listenerCount("SIGINT"), 0);
+  assert.equal(events.listeners("SIGTERM")[0], external);
+});
+
+test("pre-up cancellation releases only admission and preserves incomplete fixture runtime", async t => {
+  const { repo } = fixture(t), events = new EventEmitter();
+  const runtime = join(repo, ".dev-stack"); mkdirSync(runtime);
+  const receipt = join(runtime, "runtime.json"), running = join(runtime, "running.lock");
+  writeFileSync(receipt, "synthetic runtime preserved"); mkdirSync(running);
+  let newUp = false;
+  await assert.rejects(withLifecycleAdmission(repo, async ({ checkCancelled }) => {
+    events.emit("SIGINT");
+    await Promise.resolve(); checkCancelled(); newUp = true;
+  }, { events }), { code: "DEV_STACK_OPERATION_CANCELLED" });
+  assert.equal(newUp, false);
+  assert.equal(existsSync(join(repo, ".dev-stack-control.lock")), false);
+  assert.equal(readFileSync(receipt, "utf8"), "synthetic runtime preserved");
+  assert.equal(existsSync(running), true);
+  assert.equal(events.listenerCount("SIGINT"), 0);
+});
+
+test("cancellation during a group wait stops at its checkpoint and cannot certify disappearance", async t => {
+  const { repo } = fixture(t), events = new EventEmitter();
+  let now = 0, probes = 0;
+  await assert.rejects(withLifecycleAdmission(repo, async ({ signal }) => {
+    await waitGroupsGone([], { signal, clock: () => now,
+      pause: async milliseconds => { now += milliseconds; events.emit("SIGTERM"); },
+      assertGone: () => { probes++; throw new Error("Managed process group remains; cleanup is incomplete."); }
+    });
+    assert.fail("cancelled wait cannot return success");
+  }, { events }), { code: "DEV_STACK_OPERATION_CANCELLED" });
+  assert.equal(probes, 1); assert.equal(now, 250);
+  assert.equal(existsSync(join(repo, ".dev-stack-control.lock")), false);
+});
+
+test("cancellation plus replaced lease retains both errors and never deletes the foreign owner", async t => {
+  const { repo } = fixture(t), events = new EventEmitter();
+  const lock = join(repo, ".dev-stack-control.lock"), ownerPath = join(lock, "owner.json");
+  let retainedBytes;
+  await assert.rejects(withLifecycleAdmission(repo, async ({ checkCancelled }) => {
+    const owner = JSON.parse(readFileSync(ownerPath, "utf8"));
+    owner.token = owner.token === "f".repeat(64) ? "e".repeat(64) : "f".repeat(64);
+    writeFileSync(ownerPath, JSON.stringify(owner)); retainedBytes = readFileSync(ownerPath);
+    events.emit("SIGTERM"); checkCancelled();
+  }, { events }), error => {
+    assert.ok(error instanceof AggregateError);
+    assert.equal(error.errors.length, 2);
+    assert.equal(error.errors[0].code, "DEV_STACK_OPERATION_CANCELLED");
+    assert.equal(error.errors[1].code, "DEV_STACK_LIFECYCLE_FOREIGN");
+    return true;
+  });
+  assert.equal(existsSync(lock), true);
+  assert.deepEqual(readFileSync(ownerPath), retainedBytes);
+});
+
+test("primary and release errors retain identity; a failed release is never retried", async () => {
+  const events = new EventEmitter(), primary = new Error("original operation failure"), releaseFailure = new Error("original release failure");
+  let releases = 0;
+  await assert.rejects(withLifecycleAdmission("injected", async () => { throw primary; }, {
+    events, acquire: () => ({}), release: () => { releases++; throw releaseFailure; }
+  }), error => error instanceof AggregateError && error.errors[0] === primary && error.errors[1] === releaseFailure);
+  assert.equal(releases, 1);
+  releases = 0;
+  await assert.rejects(withLifecycleAdmission("injected", async ({ releaseAdmission }) => releaseAdmission(), {
+    events, acquire: () => ({}), release: () => { releases++; throw releaseFailure; }
+  }), error => error === releaseFailure);
+  assert.equal(releases, 1);
+});
+
+test("up handoff keeps coverage until its own handlers exist and normal shutdown is not cancellation", async () => {
+  const events = new EventEmitter(); let stopped = 0, releases = 0;
+  const upStop = () => { stopped++; };
+  const result = await withLifecycleAdmission("injected", async ({ releaseAdmission, handoffToUp }) => {
+    releaseAdmission();
+    assert.equal(events.listenerCount("SIGTERM"), 1);
+    events.once("SIGTERM", upStop); events.once("SIGINT", upStop);
+    assert.equal(events.listenerCount("SIGTERM"), 2);
+    handoffToUp();
+    assert.equal(events.listenerCount("SIGTERM"), 1);
+    events.emit("SIGTERM");
+    events.off("SIGINT", upStop);
+    return "up closed cleanly";
+  }, { events, acquire: () => ({}), release: () => { releases++; } });
+  assert.equal(result, "up closed cleanly"); assert.equal(stopped, 1); assert.equal(releases, 1);
+  assert.equal(events.listenerCount("SIGTERM"), 0); assert.equal(events.listenerCount("SIGINT"), 0);
+});
+
+test("already cancelled up handoff cannot launch services or consume cancellation as success", async () => {
+  const events = new EventEmitter(); let launched = false, upStopping = false;
+  const upStop = () => { upStopping = true; };
+  await assert.rejects(withLifecycleAdmission("injected", async ({ handoffToUp }) => {
+    events.once("SIGTERM", upStop); events.once("SIGINT", upStop);
+    try {
+      events.emit("SIGTERM");
+      assert.equal(events.listenerCount("SIGINT"), 2);
+      assert.throws(handoffToUp, { code: "DEV_STACK_OPERATION_CANCELLED" });
+      assert.equal(events.listenerCount("SIGINT"), 2);
+      handoffToUp(); launched = true;
+    } finally { events.off("SIGTERM", upStop); events.off("SIGINT", upStop); }
+  }, { events, acquire: () => ({}), release: () => {} }), { code: "DEV_STACK_OPERATION_CANCELLED" });
+  assert.equal(launched, false); assert.equal(upStopping, true);
+  assert.equal(events.listenerCount("SIGTERM"), 0); assert.equal(events.listenerCount("SIGINT"), 0);
+});
+
+test("acquisition failure restores only scope-owned handlers and never fabricates a lease", async () => {
+  const events = new EventEmitter(), failure = new Error("original lock refusal");
+  let releases = 0;
+  await assert.rejects(withLifecycleAdmission("injected", () => assert.fail(), {
+    events, acquire: () => { throw failure; }, release: () => { releases++; }
+  }), error => error === failure);
+  assert.equal(releases, 0); assert.equal(events.listenerCount("SIGTERM"), 0); assert.equal(events.listenerCount("SIGINT"), 0);
+});
+
+test("CI reset is forbidden before an observed exit and does not make signalled exit clean", () => {
+  for (const absent of [undefined, null, {}, { code: null, signal: null }]) {
+    assert.throws(() => resetAfterObservedExit(absent, () => assert.fail("no concurrent reset")), { code: "DEV_STACK_SUPERVISOR_EXIT_UNOBSERVED" });
+  }
+  let resets = 0;
+  for (const exit of [{ code: 0, signal: null }, { code: 1, signal: null }, { code: null, signal: "SIGTERM" }]) {
+    assert.equal(resetAfterObservedExit(exit, () => ++resets), resets);
+  }
+  assert.equal(resets, 3);
+});
+
+test("operation cancellation remains covered through exact lease release and handlers are then removed", async () => {
+  const events = new EventEmitter(); let releases = 0;
+  await assert.rejects(withLifecycleAdmission("injected", async () => "completed work", {
+    events, acquire: () => ({}), release: () => {
+      assert.equal(events.listenerCount("SIGTERM"), 1);
+      assert.equal(events.listenerCount("SIGINT"), 1);
+      events.emit("SIGTERM"); releases++;
+    }
+  }), { code: "DEV_STACK_OPERATION_CANCELLED" });
+  assert.equal(releases, 1); assert.equal(events.listenerCount("SIGTERM"), 0); assert.equal(events.listenerCount("SIGINT"), 0);
 });

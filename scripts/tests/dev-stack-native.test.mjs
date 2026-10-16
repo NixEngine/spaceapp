@@ -97,6 +97,9 @@ test("runner prepares only up/rebuild under the lifecycle lease and before stopp
   const source = fs.readFileSync(new URL("../dev-stack.mjs", import.meta.url), "utf8");
   const main = source.slice(source.indexOf("export async function main"));
   assert.equal([...main.matchAll(/prepareDevPtyDependency\((?:state\.)?repoRoot\)/g)].length, 2);
-  assert.match(main, /acquireLifecycleLock[\s\S]*action === "up"[\s\S]*readState[\s\S]*prepareDevPtyDependency\(repoRoot\)[\s\S]*up\(initState/);
-  assert.match(main, /readState[\s\S]*action === "rebuild"[\s\S]*prepareDevPtyDependency[\s\S]*stopState\(state\)[\s\S]*up\(state, release\)/);
+  assert.match(main, /withLifecycleAdmission[\s\S]*action === "up"[\s\S]*readState[\s\S]*prepareDevPtyDependency\(repoRoot\)[\s\S]*up\(initState/);
+  assert.match(main, /readState[\s\S]*action === "rebuild"[\s\S]*prepareDevPtyDependency[\s\S]*stopState\(state, false, \{ signal \}\)[\s\S]*checkCancelled\(\)[\s\S]*up\(state, releaseAdmission, handoffToUp\)/);
+  const lifecycle = fs.readFileSync(new URL("../dev-stack-lifecycle.mjs", import.meta.url), "utf8");
+  const admission = lifecycle.slice(lifecycle.indexOf("export async function withLifecycleAdmission"));
+  assert.match(admission, /scope = cancellationScope\(events\)[\s\S]*lease = acquire\(repoRoot\)[\s\S]*result = await work/);
 });

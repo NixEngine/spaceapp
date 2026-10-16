@@ -79,12 +79,36 @@ test("source-step observation rejects arbitrary labels before executing work", a
 test("cleanup-stage diagnostics are additive and retain the original aggregate failure", () => {
   const source = readFileSync(new URL("../dev-stack.mjs", import.meta.url), "utf8");
   assert.match(source, /cleanupErrors\.push\(error\); \/\/ Preserve the original failure/);
-  for (const stage of ["SIGNAL_CHILD_GROUP", "WAIT_CHILD_GROUPS", "DOCKER_SHUTDOWN"]) {
+  assert.ok(source.includes('recordCleanupFailure("SIGNAL_CHILD_GROUP", failure.error'));
+  for (const stage of ["WAIT_CHILD_GROUPS", "DOCKER_SHUTDOWN"]) {
     assert.ok(source.includes(`recordCleanupFailure("${stage}", error`));
   }
   assert.match(source, /throw new AggregateError\(cleanupErrors,/);
   assert.match(source, /timeoutMs: 10_000, label: "child shutdown"/);
   assert.match(source, /cleanupFailureRecord\(\{ stage, error,/);
+});
+
+test("source shutdown shares one signal coordinator, strict group wait and scoped up handoff", () => {
+  const source = readFileSync(new URL("../dev-stack.mjs", import.meta.url), "utf8");
+  assert.match(source, /const shutdown = createShutdownSignals\(\)/);
+  assert.equal((source.match(/shutdown\.signalAll\(receipts\)/gu) ?? []).length, 2);
+  assert.match(source, /Object\.freeze\(\{ name, \.\.\.record \}\)/);
+  assert.match(source, /await waitGroupsGone\(receipts, \{ timeoutMs: 10_000, label: "child shutdown" \}\)/);
+  const stopping = source.slice(source.indexOf("async function stopState"), source.indexOf("async function up"));
+  const signalChildren = stopping.indexOf("shutdown.signalAll(runtime.children);");
+  const verifyChildren = stopping.indexOf("await verifyShutdownGroups(runtime.children, shutdown,");
+  assert.ok(signalChildren >= 0 && verifyChildren > signalChildren);
+  assert.ok(!stopping.slice(signalChildren, verifyChildren).includes("throw"));
+  assert.ok(verifyChildren < stopping.indexOf("dockerOutput(state,"));
+  assert.match(stopping, /verifyShutdownGroups\(runtime\.children, shutdown, \{ timeoutMs: 10_000, label: "owned child process groups to exit", signal \}\)/);
+  assert.match(source, /withLifecycleAdmission\(repoRoot,/);
+  const ownHandlers = source.indexOf('process.once("SIGINT", stop)');
+  const handoff = source.indexOf("handoffSignals();");
+  assert.ok(ownHandlers >= 0 && handoff > ownHandlers);
+  assert.ok(handoff < source.indexOf("privateWrite(location.compose"));
+  assert.match(source, /await stopState\(state, false, \{ signal \}\);\s+checkCancelled\(\);\s+return await up\(state, releaseAdmission, handoffToUp\)/);
+  const finalization = source.slice(source.indexOf("assertDockerGone(state, reset);"), source.indexOf("if (reset) removeState"));
+  assert.ok(!finalization.includes("throwIfAborted"));
 });
 
 test("CI observes old/current supervisor exits without accepting a signalled or unobserved exit", () => {
@@ -94,6 +118,7 @@ test("CI observes old/current supervisor exits without accepting a signalled or 
   assert.match(source, /supervisorExitRecord\(supervisor\.exit\)/);
   assert.match(source, /event: "FINAL_CURRENT_EXIT", observed: supervisor\.exit !== undefined/);
   assert.match(source, /cleanupVerified: cleanupFailures\.length === 0/);
+  assert.match(source, /resetAfterObservedExit\(supervisor\.exit, reset\)/);
 });
 
 test("cleanup rejects a compose swap naming a foreign volume, service or image", () => {

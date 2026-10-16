@@ -152,3 +152,87 @@ export function releaseLifecycleLock(lease) {
   rmdirSync(paths.path);
   return { released: true, repoRoot: paths.repoRoot, path: paths.path };
 }
+
+function cancellationScope(events) {
+  const controller = new AbortController();
+  const cancel = () => {
+    if (!controller.signal.aborted) {
+      const error = new Error("Lifecycle operation interrupted; inspect retained runtime state before explicit recovery.");
+      error.code = "DEV_STACK_OPERATION_CANCELLED";
+      controller.abort(error);
+    }
+  };
+  events.on("SIGTERM", cancel);
+  try { events.on("SIGINT", cancel); }
+  catch (error) { events.off("SIGTERM", cancel); throw error; }
+  let disposed = false;
+  return {
+    signal: controller.signal,
+    check: () => controller.signal.throwIfAborted(),
+    dispose() {
+      if (disposed) return;
+      events.off("SIGTERM", cancel); events.off("SIGINT", cancel); disposed = true;
+    },
+  };
+}
+
+/** Cancellation covers acquisition/teardown until up explicitly owns its signal handlers. */
+export async function withLifecycleAdmission(repoRoot, work, { acquire = acquireLifecycleLock,
+  release = releaseLifecycleLock, events = process } = {}) {
+  let scope, lease, hasLease = false, releaseAttempted = false, releaseError;
+  let handedOff = false, hadPrimary = false, primary, result;
+  const releaseAdmission = () => {
+    if (!hasLease) throw new Error("No acquired lifecycle admission is available.");
+    if (releaseAttempted) { if (releaseError) throw releaseError; return; }
+    releaseAttempted = true;
+    try { release(lease); }
+    catch (error) { releaseError = error; throw error; }
+  };
+  try {
+    // Install before acquisition; a signal callback marks cancellation, never throws out of the event loop.
+    scope = cancellationScope(events);
+    scope.check();
+    lease = acquire(repoRoot); hasLease = true;
+    scope.check();
+    result = await work({ signal: scope.signal, checkCancelled: scope.check, releaseAdmission,
+      handoffToUp() {
+        // up calls this only after its own SIGTERM/SIGINT handlers are installed.
+        scope.check(); scope.dispose(); handedOff = true;
+      } });
+    if (!handedOff) scope.check();
+  } catch (error) { hadPrimary = true; primary = error; }
+  const cleanupErrors = [];
+  if (hasLease) {
+    try { releaseAdmission(); }
+    catch (error) { if (!hadPrimary || error !== primary) cleanupErrors.push(error); }
+  }
+  // Retain coverage through exact release's synchronous owner/lock finalization.
+  if (!handedOff) {
+    try { scope?.check(); }
+    catch (error) {
+      if (!hadPrimary) { hadPrimary = true; primary = error; }
+      else if (error !== primary) cleanupErrors.push(error);
+    }
+  }
+  try { scope?.dispose(); } catch (error) { cleanupErrors.push(error); }
+  if (hadPrimary && cleanupErrors.length) {
+    throw new AggregateError([primary, ...cleanupErrors], "Lifecycle operation and exact-owner release both failed; original failures retained.");
+  }
+  if (hadPrimary) throw primary;
+  if (cleanupErrors.length === 1) throw cleanupErrors[0];
+  if (cleanupErrors.length) throw new AggregateError(cleanupErrors, "Lifecycle admission cleanup failed.");
+  return result;
+}
+
+/** Never launch a concurrent reset while the current proof supervisor may still own its lease. */
+export function resetAfterObservedExit(exit, reset) {
+  const observed = exit !== null && typeof exit === "object"
+    && ((Number.isSafeInteger(exit.code) && exit.code >= 0 && exit.code <= 255 && exit.signal === null)
+      || (exit.code === null && typeof exit.signal === "string" && /^SIG[A-Z0-9]{1,24}$/u.test(exit.signal)));
+  if (!observed) {
+    const error = new Error("Current supervisor exit is unobserved; concurrent reset was not attempted.");
+    error.code = "DEV_STACK_SUPERVISOR_EXIT_UNOBSERVED";
+    throw error;
+  }
+  return reset();
+}

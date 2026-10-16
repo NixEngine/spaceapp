@@ -94,6 +94,18 @@ remaining resource or broken/outside symlink refuses cleanup for inspection.
 Do not delete the lock or broaden paths to suppress such a failure. This is a
 trusted-local-checkout guard, not a hostile-writer or power-loss guarantee.
 
+Shutdown attempts one birth/group-checked signal per immutable launch receipt;
+the signal handler and final cleanup share that observation, including any first
+failure. A delivered signal or absent leader does not certify group cleanup.
+Group probes may re-observe EPERM within the existing ten-second deadline, but
+only a fresh all-groups ESRCH observation succeeds; persistent denial stays a
+failure. Lifecycle cancellation covers acquisition and pre-up teardown, then
+hands off only after the source supervisor installs its own handlers. An
+interrupted rebuild does not start a new stack, releases only its exact admission
+lease, and may retain runtime recovery state. CI does not attempt a concurrent
+reset until its current supervisor has an observed exit. No lock recovery,
+permission relaxation or larger timeout is implied by this behaviour.
+
 `verify` is intended for an isolated fresh test checkout. It creates a synthetic
 owner through the ordinary one-time setup, signs in, observes the real starter
 room, opens OpenCode through the real source CLI host and inspects the terminal
