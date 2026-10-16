@@ -68,6 +68,10 @@ let browser;
 let apiReload;
 let packageRebuild;
 let afterRebuild;
+let phase = "STARTUP";
+let primaryFailure;
+let finalReceipt;
+const cleanupFailures = [];
 async function waitReady(label, requireCurrentSupervisor = false) {
   await until(async () => {
     if (!existsSync(join(root, ".dev-stack", "owner.json"))) return false;
@@ -85,12 +89,16 @@ async function waitReady(label, requireCurrentSupervisor = false) {
 }
 try {
   await waitReady("strict source startup", true);
+  phase = "HTTP_CLI_ACCEPTANCE";
   proof = await runAcceptance({ state });
+  phase = "BROWSER_UI_HMR";
   browser = process.platform === "linux"
     ? await runBrowserProof({ state,
       artifactDir: join(process.env.RUNNER_TEMP || tmpdir(), `spaceapp-dev-stack-browser-${process.pid}`) })
     : { performed: false, passed: false, reason: "Browser UI proof runs in the Linux job; this job verifies the native macOS source stack." };
+  phase = "API_WATCH";
   apiReload = await runApiReloadProof({ state });
+  phase = "PACKAGE_REBUILD";
   packageRebuild = await runPackageRebuildProof({ state, readLog: () => readFileSync(logPath, "utf8"),
     restart: async () => {
       const old = supervisor;
@@ -106,10 +114,12 @@ try {
       if (!preserved) throw new Error("Rebuild did not preserve the project, ports and generated secrets.");
       return { oldSupervisorExited: true, newSupervisorVerified: true, projectAndSecretsPreserved: true };
     } });
+  phase = "POST_REBUILD_ACCEPTANCE";
   afterRebuild = await runAcceptance({ state });
   if (afterRebuild.ownerClaimedNow || afterRebuild.starterRoomId !== proof.starterRoomId || afterRebuild.paneId !== proof.paneId) {
     throw new Error("Rebuild did not retain the original owner, starter room and pane.");
   }
+  phase = "WORKER_FAILURE";
   const runtime = JSON.parse(readFileSync(join(state.stateDir, "runtime.json"), "utf8"));
   receipts = runtime.children;
   const worker = receipts.find(record => record.name === "worker");
@@ -121,6 +131,7 @@ try {
   }
   assertGroupsGone(receipts);
   if (leftovers(state).length) throw new Error("Processes still have their cwd in owned state; cleanup is incomplete.");
+  phase = "RESET";
   reset();
   if (existsSync(state.stateDir)) throw new Error("Reset left the owned state directory.");
   for (const kind of ["container", "volume", "network"]) {
@@ -128,7 +139,7 @@ try {
       "--filter", `label=com.docker.compose.project=${state.project}`], { encoding: "utf8", timeout: 30_000 }).trim();
     if (remaining) throw new Error(`Reset left owned ${kind} resources.`);
   }
-  console.log(JSON.stringify({
+  finalReceipt = {
     schema: "spaceapp.dev-stack-ci.v2", passed: true, platform: process.platform,
     node: process.version, acceptance: proof, browser, apiReload, packageRebuild,
     postRebuildAcceptance: afterRebuild, explicitWorkerFailureVerified: true,
@@ -138,15 +149,33 @@ try {
     apiWatchReloadVerified: apiReload.passed === true, packageRebuildVerified: packageRebuild.passed === true,
     secondPlatformVerified: false,
     completeIssueAcceptance: false
-  }, null, 2));
+  };
+} catch (error) {
+  primaryFailure = error;
 } finally {
   if (!supervisor.exit && supervisor.child.pid) {
     // Only the actual child handle just created by this proof; never a historic PID.
-    supervisor.child.kill("SIGTERM");
-    await until(() => supervisor.exit !== undefined, 45_000, "proof supervisor cleanup", false).catch(() => {});
+    try {
+      supervisor.child.kill("SIGTERM");
+      await until(() => supervisor.exit !== undefined, 45_000, "proof supervisor cleanup", false);
+    } catch (error) { cleanupFailures.push(error); }
   }
   // A failed cleanup remains a failed job. Do not suppress reset/resource errors
   // or declare a clean environment merely because the leader is gone.
-  if (state && existsSync(state.stateDir)) reset();
+  if (state && existsSync(state.stateDir)) {
+    try { reset(); } catch (error) { cleanupFailures.push(error); }
+  }
   console.log(`Source-stack log: ${logPath}`);
 }
+if (primaryFailure || cleanupFailures.length) {
+  const code = error => typeof error?.code === "string" && /^[A-Z0-9_]{1,100}$/u.test(error.code)
+    ? error.code : "CI_ERROR";
+  // Preserve the original phase/failure separately from every cleanup failure.
+  // Fixed codes only: never print an HTTP body, cookie, ticket or environment.
+  console.error(JSON.stringify({ schema: "spaceapp.dev-stack-ci-failure.v1", passed: false,
+    phase, primaryCode: primaryFailure ? code(primaryFailure) : null,
+    cleanupCodes: cleanupFailures.map(code), cleanupVerified: cleanupFailures.length === 0 }));
+  throw new AggregateError([...(primaryFailure ? [primaryFailure] : []), ...cleanupFailures],
+    "Source proof or cleanup failed; original and cleanup errors retained separately.");
+}
+console.log(JSON.stringify(finalReceipt, null, 2));

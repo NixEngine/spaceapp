@@ -195,6 +195,36 @@ for (const message of [{ type: "status", status: "ERROR", statusReason: "session
     assert.throws(() => value.snapshot(), /^Error: DEV_STACK_ACCEPTANCE_/u);
   });
 }
+test("rejected terminal events retain only closed diagnostic labels and never weaken rejection", () => {
+  const cases = [
+    [{ type: "error", code: "CLI_TERMINAL_ATTACH_FAILED" }, "ERROR_ATTACH_FAILED"],
+    [{ type: "error", code: "CLI_SESSION_CLOSED" }, "ERROR_SESSION_CLOSED"],
+    [{ type: "error", code: "BAD_MESSAGE" }, "ERROR_BAD_MESSAGE"],
+    [{ type: "error", code: "CODEX_EMPTY_ASSISTANT_MESSAGE" }, "ERROR_EMPTY_ASSISTANT"],
+    [{ type: "error", code: "PRIVATE_SYNTHETIC_SECRET" }, "ERROR_OTHER"],
+    [{ type: "error", code: "constructor" }, "ERROR_OTHER"],
+    [{ type: "error", code: "__proto__" }, "ERROR_OTHER"],
+    [{ type: "session_replaced" }, "SESSION_REPLACED"],
+    [{ type: "control_denied" }, "CONTROL_DENIED"],
+    [{ type: "control_revoked" }, "CONTROL_REVOKED"],
+    [{ type: "PRIVATE_SYNTHETIC_SECRET" }, "UNKNOWN"],
+    [{ type: "constructor" }, "UNKNOWN"],
+    [{ type: "__proto__" }, "UNKNOWN"],
+  ];
+  for (const [message, label] of cases) {
+    const value = observer();
+    complete(value);
+    const expectedCode = `DEV_STACK_ACCEPTANCE_TERMINAL_EVENT_${label}`;
+    assert.throws(() => send(value, { ...message, message: "PRIVATE_SYNTHETIC_SECRET" }), error => {
+      assert.equal(error.code, expectedCode);
+      assert.equal(error.message, expectedCode);
+      assert.doesNotMatch(JSON.stringify(error), /PRIVATE_SYNTHETIC_SECRET/u);
+      return true;
+    });
+    assert.throws(() => value.snapshot(), error => error.code === expectedCode);
+  }
+});
+
 test("mismatched session, observer or v1 cannot pass as controlled WS v2", () => {
   for (const patch of [{ sessionId: "other" }, { paneId: "other" }, { runtimeId: "cli:codex" },
     { protocolVersion: 1 }, { clientMode: "OBSERVER" }, { controlState: "AVAILABLE" }, { leaseId: null }]) {

@@ -196,7 +196,16 @@ export function createTerminalObservation(expected, { maxOutputBytes = 256 * 102
           break;
         default:
           // Includes error, session_replaced, control_denied and control_revoked.
-          requireCondition(false, "TERMINAL_EVENT");
+          // Retain a fixed discriminator, never the event's free-form message,
+          // untrusted type/code, session ID, URL, ticket or terminal payload.
+          // These cases remain failures exactly as before; this is not recovery.
+          const rejected = message.type === "error"
+            ? (new Map([["CLI_SESSION_CLOSED", "ERROR_SESSION_CLOSED"], ["BAD_MESSAGE", "ERROR_BAD_MESSAGE"],
+              ["CLI_TERMINAL_ATTACH_FAILED", "ERROR_ATTACH_FAILED"],
+              ["CODEX_EMPTY_ASSISTANT_MESSAGE", "ERROR_EMPTY_ASSISTANT"]]).get(message.code) ?? "ERROR_OTHER")
+            : (new Map([["session_replaced", "SESSION_REPLACED"], ["control_denied", "CONTROL_DENIED"],
+              ["control_revoked", "CONTROL_REVOKED"]]).get(message.type) ?? "UNKNOWN");
+          requireCondition(false, `TERMINAL_EVENT_${rejected}`);
       }
     } catch (error) {
       failure ??= error;

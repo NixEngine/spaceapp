@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync,
-  readFileSync, readdirSync, realpathSync, rmSync, writeFileSync,
+  readFileSync, readdirSync, realpathSync, rmSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { createServer } from "node:http";
 import { basename, dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
@@ -75,6 +75,225 @@ export function inspectPng(buffer) {
   const height = buffer.readUInt32BE(20);
   demand(width >= 800 && width <= 4096 && height >= 600 && height <= 4096, "SCREENSHOT_SIZE");
   return { sha256: hash(buffer), byteSize: buffer.length, width, height };
+}
+
+/** Conservative allowance for Chromium's temporary singleton subdirectory/socket. */
+export function assertChromeTempPath(path) {
+  demand(typeof path === "string" && isAbsolute(path) && normalize(path) === path
+    && Buffer.byteLength(path) <= 48, "CHROME_TEMP_PATH");
+  // Chromium appends its own unique directory and SingletonSocket. Keep ample
+  // space below Linux sun_path[108], including its terminating NUL.
+  demand(Buffer.byteLength(`${path}/.org.chromium.Chromium.XXXXXX/SingletonSocket`) < 100, "CHROME_TEMP_PATH");
+  return true;
+}
+
+/** Recognition flags only: never retain or return raw Chrome startup stderr. */
+export function createStartupDiagnostics(limit = 65536) {
+  demand(Number.isInteger(limit) && limit >= 256 && limit <= 65536, "DIAGNOSTIC_LIMIT");
+  const flags = { socketPathTooLong: false, processSingletonFailure: false, crashpadFailure: false,
+    sandboxFailure: false, stderrTruncated: false, stderrBytesInspected: 0 };
+  let tail = "";
+  return {
+    consume(chunk) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      const count = Math.min(buffer.length, limit - flags.stderrBytesInspected);
+      if (count < buffer.length) flags.stderrTruncated = true;
+      if (count <= 0) return;
+      flags.stderrBytesInspected += count;
+      const text = tail + buffer.subarray(0, count).toString("utf8");
+      flags.socketPathTooLong ||= /socket path too long|ENAMETOOLONG/iu.test(text);
+      flags.processSingletonFailure ||= /process_singleton|Failed to create (?:socket directory|symlinks)|SingletonLock/iu.test(text);
+      flags.crashpadFailure ||= /crashpad[^\n]*(?:error|failed|requires)|chrome_crashpad_handler[^\n]*(?:database|required)/iu.test(text);
+      flags.sandboxFailure ||= /No usable sandbox|Running as root without --no-sandbox|Failed to move to new namespace|zygote_host_impl_linux/iu.test(text);
+      tail = text.slice(-256);
+    },
+    snapshot() { return { ...flags }; },
+  };
+}
+
+/** Primary observation is immutable even when cleanup independently fails. */
+export function browserFailureDetails(primaryCode, cleanupCodes = []) {
+  const valid = code => typeof code === "string" && /^DEV_STACK_BROWSER_[A-Z0-9_]+$/u.test(code);
+  demand((primaryCode === null || valid(primaryCode)) && Array.isArray(cleanupCodes)
+    && cleanupCodes.every(valid), "FAILURE_INPUT");
+  return { code: primaryCode ?? cleanupCodes[0] ?? null, primaryCode, cleanupCodes: [...cleanupCodes] };
+}
+
+/**
+ * Remove only a captured, private browser-owned direct child. The full tree is
+ * preflighted before mutation. Symlink targets (including broken Singletons)
+ * are never read, resolved or traversed: only the links themselves are unlinked.
+ * Call ONLY after the positively owned Chrome group and proxy are gone. This is
+ * a cooperating-local-checkout guard, not protection against hostile writers.
+ */
+export function removeOwnedBrowserDirectory(root, expected, parent, operations = {}) {
+  const stat = operations.stat ?? lstatSync;
+  const list = operations.list ?? readdirSync;
+  const unlink = operations.unlink ?? unlinkSync;
+  const remove = operations.remove ?? rmSync;
+  const uid = operations.uid ?? (typeof process.getuid === "function" ? process.getuid() : undefined);
+  const allowedName = expected?.role === "profile" ? /^browser-profile-[A-Za-z0-9]+$/u : /^bt-[A-Za-z0-9]+$/u;
+  demand(isAbsolute(root) && dirname(root) === parent && inside(parent, root)
+    && allowedName.test(basename(root)) && ["profile", "temp"].includes(expected?.role), "PROFILE_CLEANUP");
+  const identities = new Map();
+  const links = [];
+  function same(before, after) {
+    return before.dev === after.dev && before.ino === after.ino && before.uid === after.uid
+      && before.isDirectory() === after.isDirectory() && before.isSymbolicLink() === after.isSymbolicLink()
+      && before.isFile() === after.isFile() && before.isSocket() === after.isSocket();
+  }
+  function checkRoot() {
+    const info = stat(root);
+    demand(info.isDirectory() && !info.isSymbolicLink() && (info.mode & 0o777) === 0o700
+      && info.dev === expected.dev && info.ino === expected.ino && info.uid === expected.uid
+      && (uid === undefined || info.uid === uid), "PROFILE_CLEANUP");
+  }
+  checkRoot();
+  function visit(path) {
+    demand(identities.size < 50000 && (path === root || inside(root, path)), "PROFILE_CLEANUP");
+    const info = stat(path);
+    demand(info.uid === expected.uid, "PROFILE_CLEANUP");
+    identities.set(path, info);
+    if (info.isSymbolicLink()) {
+      demand(info.nlink === 1, "PROFILE_CLEANUP");
+      links.push(path);
+    } else if (info.isDirectory()) {
+      for (const name of list(path)) visit(join(path, name));
+    } else if (info.isSocket()) {
+      demand(expected.role === "temp" && basename(path) === "SingletonSocket" && info.nlink === 1, "PROFILE_CLEANUP");
+    } else demand(info.isFile() && info.nlink === 1, "PROFILE_CLEANUP");
+  }
+  visit(root);
+  function checkPath(path) {
+    checkRoot();
+    for (let directory = dirname(path); directory !== parent; directory = dirname(directory)) {
+      const current = stat(directory);
+      demand(current.isDirectory() && !current.isSymbolicLink()
+        && same(identities.get(directory), current), "PROFILE_CLEANUP");
+    }
+    demand(same(identities.get(path), stat(path)), "PROFILE_CLEANUP");
+  }
+  // Preflight completes before the first unlink; a rejected hard link cannot
+  // cause a partially removed tree. unlink never operates on a link's target.
+  for (const path of links) { checkPath(path); unlink(path); }
+  for (const [path, info] of identities) {
+    if (!info.isSymbolicLink()) {
+      if (path === root) checkRoot();
+      else checkPath(path);
+      demand(!info.isFile() || stat(path).nlink === 1, "PROFILE_CLEANUP");
+    }
+  }
+  remove(root, { recursive: true });
+  try { stat(root); }
+  catch (error) { if (error.code === "ENOENT") return true; throw error; }
+  throw fault("PROFILE_CLEANUP");
+}
+
+/**
+ * Acquisition ledger shared by the real proof and injected filesystem tests.
+ * Construction is read-only; acquire MUST run inside the caller's try/finally.
+ * A successful creation is recorded before its first lstat. Without a captured
+ * inode/UID, neither removal nor receipt writing is authorized.
+ */
+export function browserDirectoryLease({ stateDir, artifactDir, tempParent }, operations = {}) {
+  const stat = operations.stat ?? lstatSync;
+  const realpath = operations.realpath ?? realpathSync;
+  const mkdir = operations.mkdir ?? mkdirSync;
+  const mkdtemp = operations.mkdtemp ?? mkdtempSync;
+  const chmod = operations.chmod ?? chmodSync;
+  const write = operations.write ?? writeFileSync;
+  const remove = operations.removeOwned ?? removeOwnedBrowserDirectory;
+  const uid = operations.uid ?? (typeof process.getuid === "function" ? process.getuid() : undefined);
+  const parents = new Map();
+  for (const parent of new Set([stateDir, dirname(artifactDir), tempParent])) {
+    demand(typeof parent === "string" && isAbsolute(parent) && normalize(parent) === parent
+      && realpath(parent) === parent, "DIRECTORY_ROOT");
+    const info = stat(parent);
+    demand(info.isDirectory() && !info.isSymbolicLink()
+      && Number.isSafeInteger(info.dev) && Number.isSafeInteger(info.ino) && info.ino > 0
+      && Number.isSafeInteger(info.uid), "DIRECTORY_ROOT");
+    parents.set(parent, { dev: info.dev, ino: info.ino, uid: info.uid });
+  }
+  demand(browserArtifactRootAllowed(artifactDir, stateDir, tempParent, "true"), "ARTIFACT_ROOT");
+  assertChromeTempPath(`${join(tempParent, "bt-")}XXXXXX`);
+  const artifact = { path: null, identity: null };
+  const profile = { path: null, identity: null };
+  const temporary = { path: null, identity: null };
+  function sameParent(parent) {
+    const expected = parents.get(parent);
+    const info = stat(parent);
+    demand(expected && info.isDirectory() && !info.isSymbolicLink()
+      && info.dev === expected.dev && info.ino === expected.ino && info.uid === expected.uid, "DIRECTORY_ROOT_CHANGED");
+  }
+  function capture(slot, role) {
+    const info = stat(slot.path);
+    demand(info.isDirectory() && !info.isSymbolicLink()
+      && Number.isSafeInteger(info.dev) && Number.isSafeInteger(info.ino) && info.ino > 0
+      && Number.isSafeInteger(info.uid) && (uid === undefined || info.uid === uid), "DIRECTORY_IDENTITY");
+    slot.identity = { dev: info.dev, ino: info.ino, uid: info.uid, role };
+  }
+  function assertOwned(slot) {
+    demand(slot.path && slot.identity, "DIRECTORY_IDENTITY");
+    sameParent(dirname(slot.path));
+    const info = stat(slot.path);
+    demand(info.isDirectory() && !info.isSymbolicLink() && (info.mode & 0o777) === 0o700
+      && info.dev === slot.identity.dev && info.ino === slot.identity.ino && info.uid === slot.identity.uid
+      && (uid === undefined || info.uid === uid), "DIRECTORY_IDENTITY");
+  }
+  return {
+    artifact, profile, temporary,
+    acquire(setStage = () => {}) {
+      setStage("ARTIFACT_CREATE");
+      sameParent(dirname(artifactDir));
+      mkdir(artifactDir, { mode: 0o700 }); // EEXIST never adopts the existing directory.
+      artifact.path = artifactDir;
+      setStage("ARTIFACT_IDENTITY");
+      capture(artifact, "artifact");
+      setStage("ARTIFACT_PRIVATE");
+      chmod(artifact.path, 0o700);
+      assertOwned(artifact);
+      setStage("PROFILE_CREATE");
+      sameParent(stateDir);
+      profile.path = mkdtemp(join(stateDir, "browser-profile-"));
+      setStage("PROFILE_IDENTITY");
+      capture(profile, "profile");
+      setStage("PROFILE_PRIVATE");
+      chmod(profile.path, 0o700);
+      assertOwned(profile);
+      setStage("CHROME_TEMP_CREATE");
+      sameParent(tempParent);
+      temporary.path = mkdtemp(join(tempParent, "bt-"));
+      setStage("CHROME_TEMP_IDENTITY");
+      capture(temporary, "temp");
+      setStage("CHROME_TEMP_PRIVATE");
+      chmod(temporary.path, 0o700);
+      assertOwned(temporary);
+      setStage("PROFILE_HOME");
+      for (const directory of ["home", "home/config", "home/data", "home/cache"]) {
+        assertOwned(profile);
+        mkdir(join(profile.path, directory), { recursive: true, mode: 0o700 });
+      }
+    },
+    cleanup(browserGone, proxyClosed) {
+      const codes = [];
+      if (artifact.path && !artifact.identity) codes.push(`${PREFIX}ARTIFACT_IDENTITY_UNOBSERVED`);
+      function release(slot, parent, role) {
+        if (!slot.path) return true; // No successful creation to remove.
+        if (!slot.identity) { codes.push(`${PREFIX}${role}_IDENTITY_UNOBSERVED`); return false; }
+        if (!browserGone || !proxyClosed) return false;
+        try {
+          assertOwned(slot);
+          return remove(slot.path, slot.identity, parent) === true;
+        } catch { codes.push(`${PREFIX}${role}_CLEANUP`); return false; }
+      }
+      return { profileRemoved: release(profile, stateDir, "PROFILE"),
+        temporaryRemoved: release(temporary, tempParent, "TEMP"), cleanupCodes: codes };
+    },
+    writeReceipt(receipt) {
+      assertOwned(artifact);
+      write(join(artifact.path, "browser-proof.json"), `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+    },
+  };
 }
 
 class Cdp {
@@ -183,32 +402,15 @@ function chromeExecutable() {
   throw fault("CHROME_MISSING");
 }
 
-function browserEnvironment(profile) {
+function browserEnvironment(profile, temporary) {
   const environment = {};
   for (const key of ["LANG", "LC_ALL", "LC_CTYPE", "TZ"]) {
     if (process.env[key]) environment[key] = process.env[key];
   }
   return { ...environment, PATH: `${dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`,
-    HOME: join(profile, "home"), TMPDIR: join(profile, "tmp"),
+    HOME: join(profile, "home"), TMPDIR: temporary,
     XDG_CONFIG_HOME: join(profile, "home", "config"), XDG_DATA_HOME: join(profile, "home", "data"),
     XDG_CACHE_HOME: join(profile, "home", "cache") };
-}
-
-function privateProfileTree(root) {
-  // Never follow a browser-created link out of the private profile during removal.
-  const entry = lstatSync(root);
-  demand(entry.isDirectory() && !entry.isSymbolicLink() && (entry.mode & 0o777) === 0o700, "PROFILE_CLEANUP");
-  if (typeof process.getuid === "function") demand(entry.uid === process.getuid(), "PROFILE_CLEANUP");
-  let count = 0;
-  function preflight(path) {
-    demand(++count <= 50000 && (path === root || inside(root, path)), "PROFILE_CLEANUP");
-    const info = lstatSync(path);
-    demand(!info.isSymbolicLink(), "PROFILE_CLEANUP");
-    if (info.isDirectory()) {
-      for (const name of readdirSync(path)) preflight(join(path, name));
-    } else demand(info.isFile() && info.nlink === 1, "PROFILE_CLEANUP");
-  }
-  preflight(root);
 }
 
 /** Caller must own an already-running source stack with its synthetic owner claimed. */
@@ -220,17 +422,13 @@ export async function runBrowserProof({ state, artifactDir, timeoutMs = 180000 }
     && ["api", "web", "postgres", "temporal"].every(key => current.ports[key] === state.ports[key])
     && current.secrets.sessionSecret === state.secrets.sessionSecret, "STATE_CHANGED");
   demand(browserArtifactRootAllowed(artifactDir, state.stateDir, process.env.RUNNER_TEMP, process.env.CI), "ARTIFACT_ROOT");
-  const artifactParent = dirname(artifactDir);
-  demand(realpathSync(artifactParent) === artifactParent && lstatSync(artifactParent).isDirectory()
-    && !lstatSync(artifactParent).isSymbolicLink(), "ARTIFACT_ROOT");
-  mkdirSync(artifactDir, { mode: 0o700 }); // A pre-existing destination is not overwritten/adopted.
+  const tempParent = process.env.CI === "true" && process.env.RUNNER_TEMP
+    ? normalize(process.env.RUNNER_TEMP) : state.stateDir;
+  // All root/path/executable validation precedes the first filesystem acquisition.
+  const directories = browserDirectoryLease({ stateDir: state.stateDir, artifactDir, tempParent });
   const executable = chromeExecutable();
-  const profile = mkdtempSync(join(state.stateDir, "browser-profile-"));
-  chmodSync(profile, 0o700);
-  const profileIdentity = lstatSync(profile);
-  for (const directory of ["home", "tmp", "home/config", "home/data", "home/cache"]) {
-    mkdirSync(join(profile, directory), { recursive: true, mode: 0o700 });
-  }
+  let profile;
+  let temporary;
   const started = performance.now();
   const remaining = () => { const value = Math.ceil(timeoutMs - performance.now() + started); demand(value > 0, "TIMEOUT"); return value; };
   let stage = "START";
@@ -242,6 +440,8 @@ export async function runBrowserProof({ state, artifactDir, timeoutMs = 180000 }
   let exited = false;
   let startFailed = false;
   let failure;
+  const cleanupCodes = [];
+  const startupDiagnostics = createStartupDiagnostics();
   let result;
   let original;
   let changed;
@@ -329,6 +529,9 @@ export async function runBrowserProof({ state, artifactDir, timeoutMs = 180000 }
     mutated = false;
   }
   try {
+    directories.acquire(label => { stage = label; });
+    profile = directories.profile.path;
+    temporary = directories.temporary.path;
     stage = "PROXY";
     proxy = await denyProxy();
     stage = "CHROME_START";
@@ -339,7 +542,8 @@ export async function runBrowserProof({ state, artifactDir, timeoutMs = 180000 }
       "--disable-component-update", "--disable-crash-reporter", "--disable-crashpad", "--disable-default-apps",
       "--disable-dev-shm-usage", "--disable-extensions", "--disable-sync", "--disable-quic",
       "--force-webrtc-ip-handling-policy=disable_non_proxied_udp", "--no-sandbox", "about:blank"],
-    { cwd: profile, env: browserEnvironment(profile), detached: true, stdio: "ignore" });
+    { cwd: profile, env: browserEnvironment(profile, temporary), detached: true, stdio: ["ignore", "ignore", "pipe"] });
+    chrome.stderr.on("data", chunk => startupDiagnostics.consume(chunk));
     chrome.once("exit", () => { exited = true; });
     chrome.once("error", () => { startFailed = true; });
     if (chrome.pid) record = processIdentity(chrome.pid);
@@ -464,8 +668,9 @@ export async function runBrowserProof({ state, artifactDir, timeoutMs = 180000 }
   } catch (error) {
     failure = error?.code?.startsWith(PREFIX) ? error : fault(`${stage}_FAILED`);
   } finally {
-    const cleanupErrors = [];
-    try { restoreSource(); } catch { cleanupErrors.push("HMR_RESTORE"); }
+    try { restoreSource(); } catch { cleanupCodes.push(`${PREFIX}HMR_RESTORE`); }
+    let browserGone = !chrome;
+    let proxyClosed = !proxy;
     if (chrome) {
       try {
         if (record && sameProcess(record, processIdentity(record.pid))) {
@@ -481,40 +686,48 @@ export async function runBrowserProof({ state, artifactDir, timeoutMs = 180000 }
           if (!exited) signalOwnedGroup(record, "SIGKILL");
         } else if (!record) {
           chrome.kill("SIGTERM");
-          cleanupErrors.push("CHROME_IDENTITY");
+          cleanupCodes.push(`${PREFIX}CHROME_IDENTITY`);
         }
         const deadline = performance.now() + 10000;
         for (;;) {
-          try { demand(record, "CHROME_IDENTITY"); assertGroupsGone([record]); break; }
+          try { demand(record, "CHROME_IDENTITY"); assertGroupsGone([record]); browserGone = true; break; }
           catch { if (performance.now() >= deadline) throw fault("CHROME_CLEANUP"); await pause(50); }
         }
-      } catch { cleanupErrors.push("CHROME_CLEANUP"); }
+      } catch { cleanupCodes.push(`${PREFIX}CHROME_CLEANUP`); }
     }
-    try { client?.close(); } catch { cleanupErrors.push("CDP_CLEANUP"); }
-    try { await proxy?.close(); } catch { cleanupErrors.push("PROXY_CLEANUP"); }
-    if (!cleanupErrors.length) {
-      try {
-        demand(inside(state.stateDir, profile) && dirname(profile) === state.stateDir, "PROFILE_CLEANUP");
-        privateProfileTree(profile);
-        const now = lstatSync(profile);
-        demand(now.dev === profileIdentity.dev && now.ino === profileIdentity.ino, "PROFILE_CLEANUP");
-        rmSync(profile, { recursive: true });
-        demand(!existsSync(profile), "PROFILE_CLEANUP");
-      } catch { cleanupErrors.push("PROFILE_CLEANUP"); }
-    }
-    if (cleanupErrors.length) failure = fault(cleanupErrors[0]);
+    try { client?.close(); } catch { cleanupCodes.push(`${PREFIX}CDP_CLEANUP`); }
+    try { await proxy?.close(); proxyClosed = true; } catch { cleanupCodes.push(`${PREFIX}PROXY_CLEANUP`); }
+    const released = directories.cleanup(browserGone, proxyClosed);
+    const { profileRemoved, temporaryRemoved } = released;
+    cleanupCodes.push(...released.cleanupCodes);
+    const details = browserFailureDetails(failure?.code ?? null, cleanupCodes);
+    if (details.code && !failure) failure = Object.assign(new Error(details.code), { code: details.code });
+    if (failure) { failure.primaryCode = details.primaryCode; failure.cleanupCodes = [...cleanupCodes]; }
     if (result) {
       result.elapsedMs = Math.round(performance.now() - started);
       result.network.proxyDeniedRequests = proxy?.denied() ?? 0;
-      result.cleanup = { browserGroupGone: cleanupErrors.length === 0, proxyClosed: cleanupErrors.length === 0,
-        privateProfileRemoved: cleanupErrors.length === 0 };
+      result.cleanup = { browserGroupGone: browserGone, proxyClosed, privateProfileRemoved: profileRemoved,
+        privateTemporaryRemoved: temporaryRemoved };
+      result.startupDiagnostics = startupDiagnostics.snapshot();
+      result.chromeTemporaryPathBytes = directories.temporary.path ? Buffer.byteLength(directories.temporary.path) : null;
     }
     // Only bounded aggregates and screenshots are persisted, never DOM, response bodies,
     // cookies, request headers, credential values or raw CDP/console/network messages.
     const receipt = failure ? { schema: "spaceapp.dev-stack-browser.v1", passed: false,
-      stage, code: failure.code, sourceRestored: !mutated, cleanupVerified: cleanupErrors.length === 0 } : result;
-    try { writeFileSync(join(artifactDir, "browser-proof.json"), `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx", mode: 0o600 }); }
-    catch { failure ??= fault("RECEIPT_WRITE"); }
+      stage, ...details, sourceRestored: !mutated,
+      cleanupVerified: cleanupCodes.length === 0 && browserGone && proxyClosed && profileRemoved && temporaryRemoved,
+      startupDiagnostics: startupDiagnostics.snapshot(),
+      chromeTemporaryPathBytes: directories.temporary.path ? Buffer.byteLength(directories.temporary.path) : null } : result;
+    let receiptWritten = false;
+    if (directories.artifact.identity) {
+      try { directories.writeReceipt(receipt); receiptWritten = true; }
+      catch { failure ??= fault("RECEIPT_WRITE"); cleanupCodes.push(`${PREFIX}RECEIPT_WRITE`); }
+    }
+    if (failure) {
+      failure.primaryCode = details.primaryCode;
+      failure.cleanupCodes = [...cleanupCodes];
+      failure.receiptWritten = receiptWritten;
+    }
   }
   if (failure) throw failure;
   return result;
